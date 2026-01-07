@@ -1,8 +1,9 @@
-﻿# --- CONFIGURATION ---
+﻿#--- CONFIGURATION ---
 $XmlPath = "X:\Program Files\WindowsPowerShell\Modules\OSD\*\cache\driverpack-catalogs\build-driverpacks.xml"
-$SurfaceDocsUrl = "https://learn.microsoft.com/en-us/surface/manage-surface-driver-and-firmware-updates"
+$SurfaceDocsUrl = "https://support.microsoft.com/en-us/surface/download-drivers-and-firmware-for-surface-09bb2e09-2a4b-cb69-0951-078a7739e120"
+#"https://learn.microsoft.com/en-us/surface/manage-surface-driver-and-firmware-updates"
 
-# --- FUNCTIONS ---
+#--- FUNCTIONS ---
 
 function Sync-DriverToXml {
     param (
