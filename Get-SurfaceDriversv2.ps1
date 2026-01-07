@@ -79,7 +79,7 @@ Write-Host "[1/4] Scraping Microsoft Support for Driver Links..." -ForegroundCol
 try {
     $Response = Invoke-WebRequest -Uri $SurfaceDocsUrl -UseBasicParsing
     $Links = $Response.Links | Where-Object { $_.href -like "*details.aspx?id=*" } | Select-Object -ExpandProperty href -Unique
-    
+
     $DriverMap = @()
     foreach ($Url in $Links) {
         try {
