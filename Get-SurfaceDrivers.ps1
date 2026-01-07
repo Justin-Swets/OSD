@@ -70,52 +70,78 @@ try {
     Write-Host "[3/4] Local System Detected: $LocalModelRaw" -ForegroundColor Cyan
 
     # --- TIERED MATCHING LOGIC ---
-    Write-Host "[4/4] Executing Tiered Matching (Exact > Normalized > Filename > Multi-Factor Score)..." -ForegroundColor Gray
+    Write-Host "[4/4] Executing Tiered Matching Phase..." -ForegroundColor Cyan
     $BestMatch = $null
 
     # TIER 1: Literal Exact
+    Write-Host " > Tier 1: Checking for Literal Exact Match..." -ForegroundColor Gray
     $BestMatch = $DriverMap | Where-Object { $_.Model -ieq $LocalModelRaw } | Select-Object -First 1
+    if ($BestMatch) { Write-Host "   [!] Exact match found: $($BestMatch.Model)" -ForegroundColor Green }
 
     # TIER 2: "For Business" Removed Match
-    if (-not $BestMatch -and $LocalModelRaw -like "*for Business*") {
+    if (-not $BestMatch) {
+        Write-Host " > Tier 2: Checking with 'For Business' stripped..." -ForegroundColor Gray
         $BestMatch = $DriverMap | Where-Object { $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
+        if ($BestMatch) { Write-Host "   [!] Match found after normalization: $($BestMatch.Model)" -ForegroundColor Green }
     }
 
-    # TIER 3: Filename Specific Keyword Match (Requires 3+ Keyword matches)
+    # TIER 3: Filename Specific Keyword Match
     if (-not $BestMatch) {
+        Write-Host " > Tier 3: Evaluating Filename Keyword inclusion (Target: 3 matches)..." -ForegroundColor Gray
         $keywords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
-        $BestMatch = $DriverMap | Where-Object { 
-            $fn = $_.FileName.ToLower()
-            ($keywords | Where-Object { $fn.Contains($_) }).Count -ge 3
-        } | Select-Object -First 1
+        
+        foreach ($Item in $DriverMap) {
+            if ($Item.FileName) {
+                $fn = $Item.FileName.ToLower()
+                $matchCount = ($keywords | Where-Object { $fn.Contains($_) }).Count
+                if ($matchCount -ge 3) {
+                    $BestMatch = $Item
+                    Write-Host "   [!] Match found in filename: $($Item.FileName) ($matchCount keywords matched)" -ForegroundColor Green
+                    break
+                }
+            }
+        }
     }
 
-    # TIER 4: Combined Best Fit Score (Model Title + Filename)
+    # TIER 4: Combined Best Fit Score
     if (-not $BestMatch) {
-        Write-Host "      Tiers 1-3 Failed. Calculating Multi-Factor Score..." -ForegroundColor DarkGray
-        $BestMatch = $DriverMap | Select-Object *, @{Name='Score'; Expression={
-            $score = 0
-            $targetWords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
-            $scrapedTitle = $_.Model.ToLower()
-            $scrapedFile  = $_.FileName.ToLower()
+        Write-Host " > Tier 4: Tier 1-3 failed. Calculating Multi-Factor Score (Title + Filename)..." -ForegroundColor Gray
+        $targetWords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+        
+        $ScoredList = foreach ($Item in $DriverMap) {
+            $titleScore = 0
+            $fileScore = 0
+            $scrapedTitle = $Item.Model.ToLower()
+            $scrapedFile  = ($Item.FileName -as [string]).ToLower()
 
             foreach ($word in $targetWords) {
-                # Weight Model Title matches higher
-                if ($scrapedTitle.Contains($word)) { $score += 10 }
-                # Weight Filename matches as a secondary helper
-                if ($scrapedFile.Contains($word))  { $score += 5  }
+                if ($scrapedTitle.Contains($word)) { $titleScore += 10 }
+                if ($scrapedFile.Contains($word))  { $fileScore += 5 }
             }
-            $score
-        }} | Sort-Object Score -Descending | Select-Object -First 1
+            
+            $totalScore = $titleScore + $fileScore
+            [PSCustomObject]@{
+                Obj        = $Item
+                TotalScore = $totalScore
+                Breakdown  = "Title: $titleScore, File: $fileScore"
+            }
+        }
+
+        $TopScorer = $ScoredList | Sort-Object TotalScore -Descending | Select-Object -First 1
+        
+        if ($TopScorer -and $TopScorer.TotalScore -gt 0) {
+            $BestMatch = $TopScorer.Obj
+            Write-Host "   [!] Best fit chosen: $($BestMatch.Model)" -ForegroundColor Green
+            Write-Host "       Score: $($TopScorer.TotalScore) ($($TopScorer.Breakdown))" -ForegroundColor DarkGray
+        }
     }
 
     # --- FINAL SYNC ---
-    if ($BestMatch -and ($BestMatch.Score -gt 0 -or $null -ne $BestMatch.Model)) {
-        Write-Host "`nMATCH FOUND: $($BestMatch.Model)" -ForegroundColor Green
+    if ($BestMatch) {
         Sync-DriverToXml -Path $XmlPath -ModelName $BestMatch.Model -NewUrl $BestMatch.URL -FileName $BestMatch.FileName
         return $BestMatch.URL
     } else {
-        Write-Error "No reliable match found for $LocalModelRaw"
+        Write-Host "`n[ERROR] No reliable match could be determined for $LocalModelRaw" -ForegroundColor Red
     }
 
 } catch {
