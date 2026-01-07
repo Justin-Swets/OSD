@@ -60,12 +60,12 @@ function Write-NewXmlEntry {
       <T>System.Object</T>
     </TN>
     <MS>
-      <S N="Manufacturer">Microsoft</S>
-      <S N="Model">$ModelName</S>
-      <S N="Url">$NewUrl</S>
-      <S N="FileName">$FileName</S>
-      <S N="OS">Windows 10/11 x64</S>
-      <S N="Guid">$Guid</S>
+      <S N=\"Manufacturer\">Microsoft</S>
+      <S N=\"Model\">$ModelName</S>
+      <S N=\"Url\">$NewUrl</S>
+      <S N=\"FileName\">$FileName</S>
+      <S N=\"OS\">Windows 10/11 x64</S>
+      <S N=\"Guid\">$Guid</S>
     </MS>
   </Obj>
 </Objs>
@@ -91,10 +91,28 @@ try {
     $DriverMap = @()
     foreach ($Url in $Links) {
         try {
-            $Page = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5
+            $Page = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 10
+            
+            # Improved Regex for Filename Extraction
+            # This looks for the filename inside the JSON metadata or table cells on the download page
             $Name = if ($Page.Content -match "<title>Download (.*?) Drivers") { ($Matches[1] -replace " Drivers.*", "").Trim() }
-            $File = if ($Page.Content -match "([\w\d\-_]+\.msi)") { $Matches[1] }
-            if ($Name) { $DriverMap += [PSCustomObject]@{ Model = $Name; URL = $Url; FileName = $File } }
+            
+            # Strategy: Look for the specific pattern Microsoft uses for MSI filenames in their JS/HTML
+            # We filter out generic strings by ensuring it ends in .msi and contains 'Surface' or 'Pro'
+            $File = ""
+            if ($Page.Content -match '\"(Surface[^\"]+?\.msi)\"') {
+                $File = $Matches[1]
+            } elseif ($Page.Content -match '>([^>]+?\.msi)<') {
+                $File = $Matches[1]
+            }
+
+            if ($Name) { 
+                $DriverMap += [PSCustomObject]@{ 
+                    Model = $Name 
+                    URL = $Url 
+                    FileName = ($File -replace ".*\\", "") # Ensure we only get the name, not a path
+                } 
+            }
         } catch { continue }
     }
 
@@ -103,12 +121,10 @@ try {
     $LocalModelNoBus = $LocalModelRaw -replace " for Business", ""
     $CPU = (Get-CimInstance Win32_Processor).Name
 
-    # Logic to determine strict exclusion platform
     $IsSnapdragon = ($LocalModelRaw -match "Snapdragon") -or ($CPU -match "Snapdragon|SQ1|SQ2|SQ3")
     $IsIntel = ($LocalModelRaw -match "Intel") -or ($CPU -match "Intel")
     $IsAMD = ($LocalModelRaw -match "AMD") -or ($CPU -match "Ryzen")
 
-    # Fixed syntax for logging (PS 5.1 compatible)
     $LogArch = "Intel"
     if ($IsSnapdragon) { $LogArch = "Snapdragon" } elseif ($IsAMD) { $LogArch = "AMD" }
     
@@ -117,7 +133,6 @@ try {
     # --- TIERED MATCHING LOGIC ---
     Write-Host "[3/4] Performing Tiered Analysis with Architecture Exclusion..." -ForegroundColor Gray
     
-    # Pre-Filter DriverMap based on Strict Architecture Exclusion
     $FilteredMap = $DriverMap | Where-Object {
         $TargetText = ($_.Model + " " + $_.FileName).ToLower()
         if ($IsSnapdragon) { return $TargetText -notmatch "intel|amd|x64" }
@@ -136,14 +151,13 @@ try {
         $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
     }
 
-    # TIER 3: Complex Scoring (Size, Generation, Edition, CPU)
+    # TIER 3: Complex Scoring
     if (-not $FinalSelection) {
         $Keywords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
         $Candidates = foreach ($Item in $FilteredMap) {
             $Score = 0
             $SearchText = ($Item.Model + " " + $Item.FileName).ToLower()
 
-            # Architecture affinity boost
             if ($IsSnapdragon -and ($SearchText -match "arm64|snapdragon")) { $Score += 50 }
             elseif ($IsIntel -and ($SearchText -match "intel")) { $Score += 20 }
             elseif ($IsAMD -and ($SearchText -match "amd")) { $Score += 20 }
@@ -165,10 +179,10 @@ try {
     # --- FINAL WRITE ---
     if ($FinalSelection) {
         Write-Host "`n[4/4] Selection Confirmed: $($FinalSelection.Model)" -ForegroundColor Green
+        Write-Host "      MSI Identified: $($FinalSelection.FileName)" -ForegroundColor DarkGray
         Write-NewXmlEntry -Paths $TargetPaths -ModelName $FinalSelection.Model -NewUrl $FinalSelection.URL -FileName $FinalSelection.FileName
-        return $FinalSelection.URL
     } else {
-        Write-Error "No architecture-compliant match could be determined for $LocalModelRaw"
+        Write-Error "No architecture-compliant match could be determined."
     }
 
 } catch {
