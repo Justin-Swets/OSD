@@ -1,5 +1,5 @@
 ﻿# --- CONFIGURATION ---
-$XmlPath = "C:\Program Files\WindowsPowerShell\Modules\OSD\25.5.5.1\cache\driverpack-catalogs\build-driverpacks.xml"
+$XmlPath = "X:\Program Files\WindowsPowerShell\Modules\OSD\*\cache\driverpack-catalogs\build-driverpacks.xml"
 $SurfaceDocsUrl = "https://learn.microsoft.com/en-us/surface/manage-surface-driver-and-firmware-updates"
 
 # --- FUNCTIONS ---
