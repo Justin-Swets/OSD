@@ -78,4 +78,83 @@ function Write-NewXmlEntry {
 Write-Host "[1/4] Scraping Microsoft Support for Driver Links..." -ForegroundColor Cyan
 try {
     $Response = Invoke-WebRequest -Uri $SurfaceDocsUrl -UseBasicParsing
-    $Links = $Response.Links | Where-Object { $_.href -like "*details.aspx?id=
+    $Links = $Response.Links | Where-Object { $_.href -like "*details.aspx?id=*" } | Select-Object -ExpandProperty href -Unique
+    
+    $DriverMap = @()
+    foreach ($Url in $Links) {
+        try {
+            $Page = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 5
+            $Name = if ($Page.Content -match "<title>Download (.*?) Drivers") { ($Matches[1] -replace " Drivers.*", "").Trim() }
+            $File = if ($Page.Content -match "([\w\d\-_]+\.msi)") { $Matches[1] }
+            if ($Name) { $DriverMap += [PSCustomObject]@{ Model = $Name; URL = $Url; FileName = $File } }
+        } catch { continue }
+    }
+
+    # Identify Local System & Architecture
+    $LocalModelRaw = (Get-CimInstance Win32_ComputerSystem).Model
+    $LocalModelNoBus = $LocalModelRaw -replace " for Business", ""
+    $CPU = (Get-CimInstance Win32_Processor).Name
+
+    # Logic to determine strict exclusion platform
+    $IsSnapdragon = $LocalModelRaw -match "Snapdragon" -or $CPU -match "Snapdragon|SQ1|SQ2|SQ3"
+    $IsIntel = $LocalModelRaw -match "Intel" -or $CPU -match "Intel"
+    $IsAMD = $LocalModelRaw -match "AMD" -or $CPU -match "Ryzen"
+
+    $LogArch = if($IsSnapdragon){"Snapdragon"} elseif($IsAMD){"AMD"} else {"Intel"}
+    Write-Host "[2/4] Detected: $LocalModelRaw ($LogArch)" -ForegroundColor Cyan
+
+    # --- TIERED MATCHING LOGIC ---
+    Write-Host "[3/4] Performing Tiered Analysis with Architecture Exclusion..." -ForegroundColor Gray
+    
+    # Pre-Filter DriverMap based on Strict Architecture Exclusion
+    $FilteredMap = $DriverMap | Where-Object {
+        $TargetText = ($_.Model + " " + $_.FileName).ToLower()
+        if ($IsSnapdragon) { return $TargetText -notmatch "intel|amd|x64" }
+        if ($IsIntel) { return $TargetText -notmatch "snapdragon|arm64|amd" }
+        if ($IsAMD) { return $TargetText -notmatch "snapdragon|arm64|intel" }
+        return $true
+    }
+
+    $FinalSelection = $null
+
+    # TIER 1: Literal Exact Match
+    $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelRaw } | Select-Object -First 1
+
+    # TIER 2: "For Business" Stripped Match
+    if (-not $FinalSelection -and $LocalModelRaw -like "*for Business*") {
+        $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
+    }
+
+    # TIER 3: Complex Scoring (Size, Generation, Edition)
+    if (-not $FinalSelection) {
+        $Keywords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+        $Candidates = foreach ($Item in $FilteredMap) {
+            $Score = 0
+            $SearchText = ($Item.Model + " " + $Item.FileName).ToLower()
+
+            # Architecture affinity boost
+            if ($IsSnapdragon -and $SearchText -match "arm64|snapdragon") { $Score += 50 }
+            elseif ($IsIntel -and $SearchText -match "intel") { $Score += 20 }
+            elseif ($IsAMD -and $SearchText -match "amd") { $Score += 20 }
+
+            foreach ($k in $Keywords) { if ($SearchText.Contains($k)) { $Score += 10 } }
+            $Item | Add-Member -MemberType NoteProperty -Name "MatchScore" -Value $Score -Force
+            if ($Score -ge 30) { $Item }
+        }
+
+        $MatchesFound = $Candidates | Sort-Object MatchScore -Descending
+        if ($MatchesFound.Count -eq 1) { $FinalSelection = $MatchesFound[0] }
+        elseif ($MatchesFound.Count -gt 1) { $FinalSelection = Show-SelectionMenu -Options $MatchesFound }
+    }
+
+    # --- FINAL WRITE ---
+    if ($FinalSelection) {
+        Write-Host "`n[4/4] Selection Confirmed: $($FinalSelection.Model)" -ForegroundColor Green
+        Write-NewXmlEntry -Paths $TargetPaths -ModelName $FinalSelection.Model -NewUrl $FinalSelection.URL -FileName $FinalSelection.FileName
+    } else {
+        Write-Error "No architecture-compliant match could be determined."
+    }
+
+} catch {
+    Write-Error "Critical Script Failure: $($_.Exception.Message)"
+}
