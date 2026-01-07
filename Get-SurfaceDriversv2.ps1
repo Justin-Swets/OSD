@@ -122,3 +122,55 @@ try {
 
     # TIER 1: Literal Exact Match
     $FinalSelection = $DriverMap | Where-Object { $_.Model -ieq $LocalModelRaw } | Select-Object -First 1
+
+    # TIER 2: "For Business" Stripped Match
+    if (-not $FinalSelection -and $LocalModelRaw -like "*for Business*") {
+        Write-Host "      Tier 1 failed. Trying 'For Business' normalized match..." -ForegroundColor DarkGray
+        $FinalSelection = $DriverMap | Where-Object { $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
+    }
+
+    # TIER 3: Complex Multi-Factor Matching (CPU, Size, Edition, Filename)
+    if (-not $FinalSelection) {
+        Write-Host "      Performing complex tiered scoring..." -ForegroundColor DarkGray
+        $Keywords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+
+        $Candidates = foreach ($Item in $DriverMap) {
+            $Score = 0
+            $SearchText = ($Item.Model + " " + $Item.FileName).ToLower()
+
+            # Architecture Weighting
+            if ($IsSnapdragon -and $SearchText -match "arm64|snapdragon") { $Score += 50 }
+            elseif (-not $IsSnapdragon -and $SearchText -match "intel|x64") { $Score += 20 }
+
+            # Keyword Weighting (Size, Generation, Edition)
+            foreach ($k in $Keywords) {
+                if ($SearchText.Contains($k)) { $Score += 10 }
+            }
+
+            # Update the object with its score
+            $Item | Add-Member -MemberType NoteProperty -Name "MatchScore" -Value $Score -Force
+            if ($Score -ge 30) { $Item }
+        }
+
+        $MatchesFound = $Candidates | Sort-Object MatchScore -Descending
+
+        if ($MatchesFound.Count -eq 1) {
+            $FinalSelection = $MatchesFound[0]
+        } elseif ($MatchesFound.Count -gt 1) {
+            Write-Host "      Multiple candidates identified. Opening selection menu..." -ForegroundColor Yellow
+            $FinalSelection = Show-SelectionMenu -Options $MatchesFound
+        }
+    }
+
+    # --- FINAL WRITE ---
+    if ($FinalSelection) {
+        Write-Host "`n[4/4] Selection Confirmed: $($FinalSelection.Model)" -ForegroundColor Green
+        Write-NewXmlEntry -Path $XmlPath -ModelName $FinalSelection.Model -NewUrl $FinalSelection.URL -FileName $FinalSelection.FileName
+        return $FinalSelection.URL
+    } else {
+        Write-Error "Could not determine or select a matching driver package."
+    }
+
+} catch {
+    Write-Error "Critical Script Failure: $($_.Exception.Message)"
+}
