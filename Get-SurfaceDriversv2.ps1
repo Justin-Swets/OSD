@@ -82,7 +82,7 @@ function Write-NewXmlEntry {
       <S N="Name">$($SysInfo.Name)</S>
       <S N="Url">$NewUrl</S>
       <S N="FileName">$FileName</S>
-      <S N="OS">Windows 10/11 x64</S>
+      <S N="OS">Windows 11 x64</S>
       <S N="OSReleaseID">$($SysInfo.OSReleaseID)</S>
       <S N="OSArchitecture">$($SysInfo.OSArchitecture)</S>
       <S N="Guid">$Guid</S>
