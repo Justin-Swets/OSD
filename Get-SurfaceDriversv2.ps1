@@ -60,12 +60,12 @@ function Write-NewXmlEntry {
       <T>System.Object</T>
     </TN>
     <MS>
-      <S N=\"Manufacturer\">Microsoft</S>
-      <S N=\"Model\">$ModelName</S>
-      <S N=\"Url\">$NewUrl</S>
-      <S N=\"FileName\">$FileName</S>
-      <S N=\"OS\">Windows 10/11 x64</S>
-      <S N=\"Guid\">$Guid</S>
+      <S N="Manufacturer">Microsoft</S>
+      <S N="Model">$ModelName</S>
+      <S N="Url">$NewUrl</S>
+      <S N="FileName">$FileName</S>
+      <S N="OS">Windows 10/11 x64</S>
+      <S N="Guid">$Guid</S>
     </MS>
   </Obj>
 </Objs>
