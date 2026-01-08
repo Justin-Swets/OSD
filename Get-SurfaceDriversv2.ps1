@@ -106,18 +106,23 @@ function Write-NewXmlEntry {
 # Gather System Info for XML Properties
 $ComputerSystem = Get-CimInstance Win32_ComputerSystem
 $Baseboard = Get-CimInstance Win32_Baseboard
-$OS = Get-CimInstance Win32_OperatingSystem
-$ReleaseId = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "DisplayVersion" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayVersion
+$CPU = (Get-CimInstance Win32_Processor).Name
 
+# Map OS Architecture to amd64 or arm64
+$IsSnapdragon = ($ComputerSystem.Model -match "Snapdragon") -or ($CPU -match "Snapdragon|SQ1|SQ2|SQ3")
+$ArchitectureString = if ($IsSnapdragon) { "arm64" } else { "amd64" }
+
+# Registry check for Windows Release/Version
+$ReleaseId = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "DisplayVersion" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayVersion
 if (-not $ReleaseId) {
     $ReleaseId = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "ReleaseId" | Select-Object -ExpandProperty ReleaseId
 }
 
 $SystemInfo = @{
-    Product        = $ComputerSystem.Model
-    Name           = $Baseboard.Product # SystemSku logic per requirements
+    Product        = $ComputerSystem.SystemSkuNumber # Modified per requirements
+    Name           = $Baseboard.Product
     OSReleaseID    = $ReleaseId
-    OSArchitecture = $OS.OSArchitecture
+    OSArchitecture = $ArchitectureString
 }
 
 Write-Host "[1/4] Scraping Microsoft Support for Driver Links..." -ForegroundColor Cyan
@@ -160,18 +165,15 @@ try {
     }
 
     # Identify Local System & Architecture
-    $LocalModelRaw = $SystemInfo.Product
+    $LocalModelRaw = $ComputerSystem.Model
     $LocalModelNoBus = $LocalModelRaw -replace " for Business", ""
-    $CPU = (Get-CimInstance Win32_Processor).Name
-
-    $IsSnapdragon = ($LocalModelRaw -match "Snapdragon") -or ($CPU -match "Snapdragon|SQ1|SQ2|SQ3")
+    
     $IsIntel = ($LocalModelRaw -match "Intel") -or ($CPU -match "Intel")
     $IsAMD = ($LocalModelRaw -match "AMD") -or ($CPU -match "Ryzen")
-
-    $LogArch = "Intel"
-    if ($IsSnapdragon) { $LogArch = "Snapdragon" } elseif ($IsAMD) { $LogArch = "AMD" }
     
-    Write-Host "[2/4] Detected: $LocalModelRaw ($LogArch)" -ForegroundColor Cyan
+    $LogArch = if($IsSnapdragon){"Snapdragon"} elseif($IsAMD){"AMD"} else {"Intel"}
+    Write-Host "[2/4] Detected Device: $LocalModelRaw ($LogArch)" -ForegroundColor Cyan
+    Write-Host "      SKU: $($SystemInfo.Name) | SKU Number: $($SystemInfo.Product)" -ForegroundColor Gray
 
     # --- TIERED MATCHING LOGIC ---
     $FilteredMap = $DriverMap | Where-Object {
