@@ -20,8 +20,8 @@ try {
 function Show-SelectionMenu {
     param([array]$Options)
     $Form = New-Object System.Windows.Forms.Form
-    $Form.Text = "Surface Driver Selection"
-    $Form.Size = New-Object System.Drawing.Size(700,450)
+    $Form.Text = "Surface Driver Selection - Scroll right for Filename/Date"
+    $Form.Size = New-Object System.Drawing.Size(1000,500)
     $Form.StartPosition = "CenterScreen"
     $Form.FormBorderStyle = "FixedDialog"
     $Form.MaximizeBox = $false
@@ -32,15 +32,25 @@ function Show-SelectionMenu {
     $Form.Controls.Add($Label)
 
     $ListBox = New-Object System.Windows.Forms.ListBox
-    $ListBox.Location = New-Object System.Drawing.Point(10,40); $ListBox.Size = New-Object System.Drawing.Size(660,300)
+    $ListBox.Location = New-Object System.Drawing.Point(10,40); $ListBox.Size = New-Object System.Drawing.Size(960,320)
+    $ListBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+    $ListBox.HorizontalScrollbar = $true
+
+    $MaxWidth = 0
+    $Graphics = $ListBox.CreateGraphics()
+
     foreach ($Opt in $Options) { 
-        [void]$ListBox.Items.Add("Score: $($Opt.MatchScore) | Model: $($Opt.Model) | File: $($Opt.FileName)") 
+        $ItemString = "Score: $($Opt.MatchScore.ToString().PadRight(3)) | Date: $($Opt.Date.PadRight(12)) | Model: $($Opt.Model.PadRight(35)) | File: $($Opt.FileName)"
+        [void]$ListBox.Items.Add($ItemString)
+        $TextSize = $Graphics.MeasureString($ItemString, $ListBox.Font)
+        if ($TextSize.Width -gt $MaxWidth) { $MaxWidth = $TextSize.Width }
     }
+    $ListBox.HorizontalExtent = [int]$MaxWidth + 50
     $ListBox.SelectedIndex = 0; $Form.Controls.Add($ListBox)
 
     $Button = New-Object System.Windows.Forms.Button
-    $Button.Text = "Confirm Selection"; $Button.Location = New-Object System.Drawing.Point(280,355)
-    $Button.Size = New-Object System.Drawing.Size(120,30); $Button.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $Button.Text = "Confirm Selection"; $Button.Location = New-Object System.Drawing.Point(430,380)
+    $Button.Size = New-Object System.Drawing.Size(140,35); $Button.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $Form.Controls.Add($Button); $Form.AcceptButton = $Button
 
     if ($Form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $Options[$ListBox.SelectedIndex] }
@@ -48,7 +58,13 @@ function Show-SelectionMenu {
 }
 
 function Write-NewXmlEntry {
-    param ([array]$Paths, [string]$ModelName, [string]$NewUrl, [string]$FileName)
+    param (
+        [array]$Paths, 
+        [string]$ModelName, 
+        [string]$NewUrl, 
+        [string]$FileName,
+        [hashtable]$SysInfo
+    )
     
     $Guid = [guid]::NewGuid().ToString()
     $XmlContent = @"
@@ -61,10 +77,14 @@ function Write-NewXmlEntry {
     </TN>
     <MS>
       <S N="Manufacturer">Microsoft</S>
+      <S N="Product">$($SysInfo.Product)</S>
       <S N="Model">$ModelName</S>
+      <S N="Name">$($SysInfo.Name)</S>
       <S N="Url">$NewUrl</S>
       <S N="FileName">$FileName</S>
       <S N="OS">Windows 10/11 x64</S>
+      <S N="OSReleaseID">$($SysInfo.OSReleaseID)</S>
+      <S N="OSArchitecture">$($SysInfo.OSArchitecture)</S>
       <S N="Guid">$Guid</S>
     </MS>
   </Obj>
@@ -83,6 +103,23 @@ function Write-NewXmlEntry {
 
 # --- MAIN EXECUTION ---
 
+# Gather System Info for XML Properties
+$ComputerSystem = Get-CimInstance Win32_ComputerSystem
+$Baseboard = Get-CimInstance Win32_Baseboard
+$OS = Get-CimInstance Win32_OperatingSystem
+$ReleaseId = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "DisplayVersion" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty DisplayVersion
+
+if (-not $ReleaseId) {
+    $ReleaseId = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion" -Name "ReleaseId" | Select-Object -ExpandProperty ReleaseId
+}
+
+$SystemInfo = @{
+    Product        = $ComputerSystem.Model
+    Name           = $Baseboard.Product # SystemSku logic per requirements
+    OSReleaseID    = $ReleaseId
+    OSArchitecture = $OS.OSArchitecture
+}
+
 Write-Host "[1/4] Scraping Microsoft Support for Driver Links..." -ForegroundColor Cyan
 try {
     $Response = Invoke-WebRequest -Uri $SurfaceDocsUrl -UseBasicParsing
@@ -93,12 +130,17 @@ try {
         try {
             $Page = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 10
             
-            # Improved Regex for Filename Extraction
-            # This looks for the filename inside the JSON metadata or table cells on the download page
             $Name = if ($Page.Content -match "<title>Download (.*?) Drivers") { ($Matches[1] -replace " Drivers.*", "").Trim() }
             
-            # Strategy: Look for the specific pattern Microsoft uses for MSI filenames in their JS/HTML
-            # We filter out generic strings by ensuring it ends in .msi and contains 'Surface' or 'Pro'
+            # Date Extraction
+            $Date = "Unknown"
+            if ($Page.Content -match 'Date Published:</span>\s*<span>(.*?)</span>') {
+                $Date = $Matches[1].Trim()
+            } elseif ($Page.Content -match '(\d{1,2}/\d{1,2}/\d{4})') {
+                $Date = $Matches[1]
+            }
+
+            # Filename Extraction
             $File = ""
             if ($Page.Content -match '\"(Surface[^\"]+?\.msi)\"') {
                 $File = $Matches[1]
@@ -110,14 +152,15 @@ try {
                 $DriverMap += [PSCustomObject]@{ 
                     Model = $Name 
                     URL = $Url 
-                    FileName = ($File -replace ".*\\", "") # Ensure we only get the name, not a path
+                    FileName = ($File -replace ".*\\", "")
+                    Date = $Date
                 } 
             }
         } catch { continue }
     }
 
     # Identify Local System & Architecture
-    $LocalModelRaw = (Get-CimInstance Win32_ComputerSystem).Model
+    $LocalModelRaw = $SystemInfo.Product
     $LocalModelNoBus = $LocalModelRaw -replace " for Business", ""
     $CPU = (Get-CimInstance Win32_Processor).Name
 
@@ -131,8 +174,6 @@ try {
     Write-Host "[2/4] Detected: $LocalModelRaw ($LogArch)" -ForegroundColor Cyan
 
     # --- TIERED MATCHING LOGIC ---
-    Write-Host "[3/4] Performing Tiered Analysis with Architecture Exclusion..." -ForegroundColor Gray
-    
     $FilteredMap = $DriverMap | Where-Object {
         $TargetText = ($_.Model + " " + $_.FileName).ToLower()
         if ($IsSnapdragon) { return $TargetText -notmatch "intel|amd|x64" }
@@ -143,44 +184,33 @@ try {
 
     $FinalSelection = $null
 
-    # TIER 1: Literal Exact Match
-    $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelRaw } | Select-Object -First 1
-
-    # TIER 2: "For Business" Stripped Match
-    if (-not $FinalSelection -and ($LocalModelRaw -like "*for Business*")) {
-        $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
-    }
+    # TIER 1/2: Match
+    $FinalSelection = $FilteredMap | Where-Object { $_.Model -ieq $LocalModelRaw -or $_.Model -ieq $LocalModelNoBus } | Select-Object -First 1
 
     # TIER 3: Complex Scoring
     if (-not $FinalSelection) {
+        Write-Host "[3/4] Performing Tiered Analysis..." -ForegroundColor Gray
         $Keywords = $LocalModelNoBus.ToLower().Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
         $Candidates = foreach ($Item in $FilteredMap) {
             $Score = 0
             $SearchText = ($Item.Model + " " + $Item.FileName).ToLower()
-
             if ($IsSnapdragon -and ($SearchText -match "arm64|snapdragon")) { $Score += 50 }
             elseif ($IsIntel -and ($SearchText -match "intel")) { $Score += 20 }
             elseif ($IsAMD -and ($SearchText -match "amd")) { $Score += 20 }
-
             foreach ($k in $Keywords) { if ($SearchText.Contains($k)) { $Score += 10 } }
-            
             $Item | Add-Member -MemberType NoteProperty -Name "MatchScore" -Value $Score -Force
             if ($Score -ge 30) { $Item }
         }
-
         $MatchesFound = $Candidates | Sort-Object MatchScore -Descending
-        if ($MatchesFound.Count -eq 1) { 
-            $FinalSelection = $MatchesFound[0] 
-        } elseif ($MatchesFound.Count -gt 1) { 
-            $FinalSelection = Show-SelectionMenu -Options $MatchesFound 
-        }
+        if ($MatchesFound.Count -eq 1) { $FinalSelection = $MatchesFound[0] }
+        elseif ($MatchesFound.Count -gt 1) { $FinalSelection = Show-SelectionMenu -Options $MatchesFound }
     }
 
     # --- FINAL WRITE ---
     if ($FinalSelection) {
         Write-Host "`n[4/4] Selection Confirmed: $($FinalSelection.Model)" -ForegroundColor Green
         Write-Host "      MSI Identified: $($FinalSelection.FileName)" -ForegroundColor DarkGray
-        Write-NewXmlEntry -Paths $TargetPaths -ModelName $FinalSelection.Model -NewUrl $FinalSelection.URL -FileName $FinalSelection.FileName
+        Write-NewXmlEntry -Paths $TargetPaths -ModelName $FinalSelection.Model -NewUrl $FinalSelection.URL -FileName $FinalSelection.FileName -SysInfo $SystemInfo
     } else {
         Write-Error "No architecture-compliant match could be determined."
     }
