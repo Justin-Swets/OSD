@@ -109,7 +109,7 @@ $Baseboard = Get-CimInstance Win32_Baseboard
 $CPU = (Get-CimInstance Win32_Processor).Name
 
 # Map OS Architecture to amd64 or arm64
-$IsSnapdragon = ($ComputerSystem.Model -match "Snapdragon") -or ($CPU -match "Snapdragon|SQ1|SQ2|SQ3")
+$IsSnapdragon = ($ComputerSystem.Model -match "Snapdragon") -or ($CPU -match "Snapdragon|SQ1|SQ2|SQ3") -or ((Get-CimInstance Win32_Processor).Manufacturer -like "*Qualcomm*")
 $ArchitectureString = if ($IsSnapdragon) { "arm64" } else { "amd64" }
 
 # Registry check for Windows Release/Version
