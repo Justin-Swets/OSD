@@ -43,7 +43,7 @@ $jsonContent = @"
 
 # 2. Output the content to the file
 # We use -Encoding utf8 to ensure standard JSON compatibility
-$jsonContent | Out-File -FilePath "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\Workflow\Default\os-arm64.json" -Encoding utf8 -Force
+$jsonContent | Out-File -FilePath "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\*\Workflow\Default\os-arm64.json" -Encoding utf8 -Force
 
 Write-Host "File 'os-arm64.json' has been created successfully." -ForegroundColor Cyan
 
