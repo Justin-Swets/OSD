@@ -4,41 +4,74 @@ If ($env:processor_architecture -eq "ARM64") {
 # 1. Define the content using a Here-String
 $jsonContent = @"
 {
-    "OSActivation.default": "Volume",
-    "OSActivation.values": [
-        "Retail",
-        "Volume"
-    ],
-    "OSEdition.default": "Enterprise",
-    "OSEditionId.default": "Enterprise",
-    "OSEdition.values": [
-        {
-            "Edition": "Home",
-            "EditionId": "Core"
-        },
-        {
-            "Edition": "Pro",
-            "EditionId": "Professional"
-        },
-        {
-            "Edition": "Enterprise",
-            "EditionId": "Enterprise"
-        }
-    ],
-    "OSLanguageCode.default": "en-us",
-    "OSLanguageCode.values": [
-        "ar-sa", "bg-bg", "cs-cz", "da-dk", "de-de", "el-gr", "en-gb", "en-us",
-        "es-es", "es-mx", "et-ee", "fi-fi", "fr-ca", "fr-fr", "he-il", "hr-hr",
-        "hu-hu", "it-it", "ja-jp", "ko-kr", "lt-lt", "lv-lv", "nb-no", "nl-nl",
-        "pl-pl", "pt-br", "pt-pt", "ro-ro", "ru-ru", "sk-sk", "sl-si", "sr-latn-rs",
-        "sv-se", "th-th", "tr-tr", "uk-ua", "zh-cn", "zh-tw"
-    ],
-    "OSName.default": "Win11-25H2-arm64",
-    "OSName.values": [
-        "Win11-25H2-arm64",
-        "Win11-24H2-arm64",
-        "Win11-23H2-arm64"
+  "OperatingSystem": {
+    "default": "Windows 11 25H2",
+    "values": ["Windows 11 25H2", "Windows 11 24H2", "Windows 11 23H2"]
+  },
+  "OSActivation": {
+    "default": "Volume",
+    "values": ["Retail", "Volume"]
+  },
+  "OSEdition": {
+    "default": "Enterprise",
+    "values": [
+      {
+        "Edition": "Home",
+        "EditionId": "Core"
+      },
+      {
+        "Edition": "Pro",
+        "EditionId": "Professional"
+      },
+      {
+        "Edition": "Enterprise",
+        "EditionId": "Enterprise"
+      }
     ]
+  },
+  "OSLanguageCode": {
+    "default": "en-us",
+    "values": [
+      "ar-sa",
+      "bg-bg",
+      "cs-cz",
+      "da-dk",
+      "de-de",
+      "el-gr",
+      "en-gb",
+      "en-us",
+      "es-es",
+      "es-mx",
+      "et-ee",
+      "fi-fi",
+      "fr-ca",
+      "fr-fr",
+      "he-il",
+      "hr-hr",
+      "hu-hu",
+      "it-it",
+      "ja-jp",
+      "ko-kr",
+      "lt-lt",
+      "lv-lv",
+      "nb-no",
+      "nl-nl",
+      "pl-pl",
+      "pt-br",
+      "pt-pt",
+      "ro-ro",
+      "ru-ru",
+      "sk-sk",
+      "sl-si",
+      "sr-latn-rs",
+      "sv-se",
+      "th-th",
+      "tr-tr",
+      "uk-ua",
+      "zh-cn",
+      "zh-tw"
+    ]
+  }
 }
 "@
 
