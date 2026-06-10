@@ -82,20 +82,6 @@ $jsonContent = @"
             "Edition": "Enterprise",
             "EditionId": "Enterprise"
         }
-    ],
-    "OSLanguageCode.default": "en-us",
-    "OSLanguageCode.values": [
-        "ar-sa", "bg-bg", "cs-cz", "da-dk", "de-de", "el-gr", "en-gb", "en-us",
-        "es-es", "es-mx", "et-ee", "fi-fi", "fr-ca", "fr-fr", "he-il", "hr-hr",
-        "hu-hu", "it-it", "ja-jp", "ko-kr", "lt-lt", "lv-lv", "nb-no", "nl-nl",
-        "pl-pl", "pt-br", "pt-pt", "ro-ro", "ru-ru", "sk-sk", "sl-si", "sr-latn-rs",
-        "sv-se", "th-th", "tr-tr", "uk-ua", "zh-cn", "zh-tw"
-    ],
-    "OSName.default": "Win11-25H2-amd64",
-    "OSName.values": [
-        "Win11-25H2-amd64",
-        "Win11-24H2-amd64",
-        "Win11-23H2-amd64"
     ]
 }
 "@
