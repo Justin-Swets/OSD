@@ -4,3 +4,4 @@ Start-Process powershell.exe -ArgumentList @(
     "-ExecutionPolicy Bypass", 
     "-WindowStyle Normal", 
     "-Command", "iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Cloud-Provision.ps1)" -wait -windowstyle normal
+)
