@@ -198,5 +198,23 @@ Write-Host "File 'os-amd64.json' has been created successfully." -ForegroundColo
 
 #if ($null -eq $(Get-OSDCatalogDriverPack).name){iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Get-SurfaceDriversv4.ps1)}
 Deploy-OSDCloud
-Restart-Computer
+
 }
+
+####Validation Check
+Add-Type -AssemblyName System.Windows.Forms
+$C= Get-Content "X:\Windows\temp\"
+if ($c -notmatch "SUCCESS"){
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = "Log Check Failed"; $f.size = "350,150"; $f.topmost = $true; $f.StartPosition = "CenterScreen"
+    $l = New-Object System.Windows.Forms.Label; $l.text = "OSDCloud Did Not Complete Successfully"; $l.Location = "10,10"; $l.size = "320,40"; 
+    $b1 = New-Object System.Windows.Forms.Button; 
+    $b1.text = "Wipe and Reboot"; $b1.size = "130,35"; $b1.Location = "125,70"; 
+    $b1.Add_Click({$f.Close(); Clear-Disk -Number 0 -RemoveData -Confirm:$false;Restart-Computer -Force})
+    $b2 = New-Object System.Windows.Forms.Button;
+    $b2.text = "Restart OSDCloud"; $b2.size = "150,35"; $b2.Location = "170,70";
+    $b2.Add_Click({$f.Close(); Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1" -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -NoExit})
+    $f.Controls.Add($l); $f.Controls.Add($b1); $f.Controls.Add($b2); $f.ShowDialog() | Out-Null
+
+}Else {Restart-Computer -Force}
