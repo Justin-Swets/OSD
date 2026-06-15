@@ -203,7 +203,7 @@ Deploy-OSDCloud
 
 ####Validation Check
 Add-Type -AssemblyName System.Windows.Forms
-$C= Get-Content "X:\Windows\temp\"
+$C= Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
 if ($c -notmatch "SUCCESS"){
 
     $f = New-Object System.Windows.Forms.Form
