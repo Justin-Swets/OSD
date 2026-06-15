@@ -204,7 +204,7 @@ Deploy-OSDCloud
 ####Validation Check
 Add-Type -AssemblyName System.Windows.Forms
 $C= Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
-if ($c -notmatch "SUCCESS"){
+if ($c -notmatch "Stop Logs"){
 
     $f = New-Object System.Windows.Forms.Form
     $f.Text = "Log Check Failed"; $f.size = "350,150"; $f.topmost = $true; $f.StartPosition = "CenterScreen"
