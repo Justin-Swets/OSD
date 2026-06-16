@@ -204,7 +204,7 @@ Deploy-OSDCloud
 ####Validation Check
 Add-Type -AssemblyName System.Windows.Forms
 $C= Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
-if ($c -notmatch "Workflow Task execution done."){
+if ($c -notmatch "*Workflow Task execution done.*"){
 
     $f = New-Object System.Windows.Forms.Form
     $f.Text = "Log Check Failed"; $f.size = "450,180"; $f.topmost = $true; $f.StartPosition = "CenterScreen"
@@ -214,7 +214,7 @@ if ($c -notmatch "Workflow Task execution done."){
     $b1.Add_Click({$f.Close(); Clear-Disk -Number 0 -RemoveData -Confirm:$false;Restart-Computer -Force})
     $b2 = New-Object System.Windows.Forms.Button;
     $b2.text = "Restart OSDCloud"; $b2.size = "160,35"; $b2.Location = "200,80";
-    $b2.Add_Click({$f.Close(); Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1" -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -NoExit})
+    $b2.Add_Click({$f.Close(); Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1 -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal"})
     $f.Controls.Add($l); $f.Controls.Add($b1); $f.Controls.Add($b2); $f.ShowDialog() | Out-Null
 
 }Else {Restart-Computer -Force}
