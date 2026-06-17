@@ -14,7 +14,7 @@ function Test-OSDCloudProvisionValidation {
             $b2.text = "Restart OSDCloud"; $b2.size = "160,35"; $b2.Location = "200,80";
             $b2.Add_Click({$f.Close(); Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1 -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal"})
             $f.Controls.Add($l); $f.Controls.Add($b1); $f.Controls.Add($b2); $f.ShowDialog() | Out-Null
-        }Else{Restart-Computer -Force}
+        }Else{$RestartPC = "True"}
     }
 }
 
