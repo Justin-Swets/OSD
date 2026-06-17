@@ -2,8 +2,8 @@
 function Test-OSDCloudProvisionValidation {
     Add-Type -AssemblyName System.Windows.Forms
     if (Test-Path "X:\Windows\temp\osdcloud-logs\transcript*.log") {
-        $C= Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
-        if ($c -notlike "*Workflow Task execution done.*"){
+        $C = Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log" -Raw
+        if ($C -notmatch "Workflow Task execution done"){
             $f = New-Object System.Windows.Forms.Form
             $f.Text = "Log Check Failed"; $f.size = "450,180"; $f.topmost = $true; $f.StartPosition = "CenterScreen"
             $l = New-Object System.Windows.Forms.Label; $l.text = "OSDCloud Did Not Complete Successfully"; $l.Location = "10,10"; $l.size = "400,40"; 
