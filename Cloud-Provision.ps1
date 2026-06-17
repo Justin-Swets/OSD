@@ -1,3 +1,50 @@
+###OSDValidation Function
+function Test-OSDCloudProvisionValidation {
+    Add-Type -AssemblyName System.Windows.Forms
+
+    $logContent = Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
+
+    if ($logContent -notmatch "Workflow Task execution done") {
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = "Log Check Failed"
+        $form.Size = "450,180"
+        $form.TopMost = $true
+        $form.StartPosition = "CenterScreen"
+
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = "OSDCloud Did Not Complete Successfully"
+        $label.Location = "10,10"
+        $label.Size = "400,40"
+
+        $buttonReboot = New-Object System.Windows.Forms.Button
+        $buttonReboot.Text = "Wipe and Reboot"
+        $buttonReboot.Size = "160,35"
+        $buttonReboot.Location = "10,80"
+        $buttonReboot.Add_Click({
+            $form.Close()
+            Clear-Disk -Number 0 -RemoveData -Confirm:$false
+            Restart-Computer -Force
+        })
+
+        $buttonRestart = New-Object System.Windows.Forms.Button
+        $buttonRestart.Text = "Restart OSDCloud"
+        $buttonRestart.Size = "160,35"
+        $buttonRestart.Location = "200,80"
+        $buttonRestart.Add_Click({
+            $form.Close()
+            Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1 -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal"
+        })
+
+        $form.Controls.Add($label)
+        $form.Controls.Add($buttonReboot)
+        $form.Controls.Add($buttonRestart)
+        $form.ShowDialog() | Out-Null
+    }
+    else {
+        $RestartPC = "True"   }
+}
+
+##########Update the OS JSON for the GUI default settings
 If ($env:processor_architecture -eq "ARM64") {
     ##Update OSDCLoudGUI Image Type
 
@@ -85,6 +132,9 @@ Write-Host "File 'os-arm64.json' has been created successfully." -ForegroundColo
 
 #if ($null -eq $(Get-OSDCatalogDriverPack).name){iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Get-SurfaceDriversv4.ps1)}
 Deploy-OSDCloud
+Test-OSDCloudProvisionValidation
+If ($RestartPC -eq "True") {
+    Restart-Computer -Force}
 
 }elseif ($env:processor_architecture -eq "AMD64") {
 
@@ -198,23 +248,9 @@ Write-Host "File 'os-amd64.json' has been created successfully." -ForegroundColo
 
 #if ($null -eq $(Get-OSDCatalogDriverPack).name){iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Get-SurfaceDriversv4.ps1)}
 Deploy-OSDCloud
+Test-OSDCloudProvisionValidation
+If ($RestartPC -eq "True") {
+    Restart-Computer -Force}
 
 }
 
-####Validation Check
-Add-Type -AssemblyName System.Windows.Forms
-$C= Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
-if ($c -notmatch "*Workflow Task execution done.*"){
-
-    $f = New-Object System.Windows.Forms.Form
-    $f.Text = "Log Check Failed"; $f.size = "450,180"; $f.topmost = $true; $f.StartPosition = "CenterScreen"
-    $l = New-Object System.Windows.Forms.Label; $l.text = "OSDCloud Did Not Complete Successfully"; $l.Location = "10,10"; $l.size = "400,40"; 
-    $b1 = New-Object System.Windows.Forms.Button; 
-    $b1.text = "Wipe and Reboot"; $b1.size = "160,35"; $b1.Location = "10,80"; 
-    $b1.Add_Click({$f.Close(); Clear-Disk -Number 0 -RemoveData -Confirm:$false;Restart-Computer -Force})
-    $b2 = New-Object System.Windows.Forms.Button;
-    $b2.text = "Restart OSDCloud"; $b2.size = "160,35"; $b2.Location = "200,80";
-    $b2.Add_Click({$f.Close(); Start-Process powershell.exe -ArgumentList "-File X:\Windows\Provision.ps1 -NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal"})
-    $f.Controls.Add($l); $f.Controls.Add($b1); $f.Controls.Add($b2); $f.ShowDialog() | Out-Null
-
-}Else {Restart-Computer -Force}
