@@ -4,7 +4,7 @@ function Test-OSDCloudProvisionValidation {
 
     $logContent = Get-Content "X:\Windows\temp\osdcloud-logs\transcript*.log"
 
-    if ($logContent -notmatch "Workflow Task execution done") {
+    if ($logContent -notlike "*Workflow Task execution done*") {
         $form = New-Object System.Windows.Forms.Form
         $form.Text = "Log Check Failed"
         $form.Size = "450,180"
