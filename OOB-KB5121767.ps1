@@ -66,10 +66,15 @@ function Install-KBUpdate {
         throw "Package not found: $PackagePath"
     }
 
-    Write-Host "Installing update package from $PackagePath"
+    if (-not (Test-Path -LiteralPath (Join-Path $TargetRoot 'Windows'))) {
+        throw "Target Windows root not found: $TargetRoot"
+    }
+
+    Ensure-Directory -Path (Join-Path $TargetRoot 'Temp\KB5121767')
+
     $logPath = Join-Path $TargetRoot 'Windows\Logs\KB5121767-install.log'
-    $wusaArgs = @('/quiet', '/norestart', '/extract:' + $TargetRoot + 'Temp\KB5121767', $PackagePath)
-    Start-Process -FilePath 'wusa.exe' -ArgumentList $wusaArgs -Wait -PassThru -NoNewWindow | Out-Null
+    Write-Host "Installing update package from $PackagePath"
+    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath
 }
 
 $packageOnDrive = Find-KBPackage -RootPath $SourceDrive
