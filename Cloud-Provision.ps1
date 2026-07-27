@@ -225,6 +225,9 @@ Write-Host "File 'os-amd64.json' has been created successfully." -ForegroundColo
 
 #if ($null -eq $(Get-OSDCatalogDriverPack).name){iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Get-SurfaceDriversv4.ps1)}
 Deploy-OSDCloud
+If ((get-ciminstance -Class "Win32_ComputerSystem").Model -like "*Surface Laptop for Business 7th*") {
+    {iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/OOB-KB5121767.ps1)}# Do something
+}
 Test-OSDCloudProvisionValidation
 If ($RestartPC -eq "True") {
     Restart-Computer -Force}
