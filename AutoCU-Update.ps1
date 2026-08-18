@@ -121,9 +121,12 @@ function Get-LatestKBFromUpdateHistory {
 		$dateMatch = [regex]::Match($segment, '([A-Za-z]+\s+\d{1,2},\s+\d{4})|((?:20)\d{2}-\d{2}-\d{2})')
 		if ($dateMatch.Success) {
 			$dateText = $dateMatch.Value
-			if ([datetime]::TryParse($dateText, [ref]$d)) {
-				$results += [pscustomobject]@{ KB = $kb; Date = $d }
+			try {
+				$d = [datetime]::Parse($dateText)
+				$is25 = $segment -match '25H2|version\s*25H2|25-H2'
+				$results += [pscustomobject]@{ KB = $kb; Date = $d; Segment = $segment; Is25H2 = $is25 }
 			}
+			catch { }
 		}
 	}
 
@@ -140,9 +143,14 @@ function Get-LatestKBFromUpdateHistory {
 	}
 
 	Write-Host "Update-history candidates:" -ForegroundColor Cyan
-	$recent | ForEach-Object { Write-Host "  $($_.KB) - $($_.Date.ToShortDateString())" }
+	$recent | ForEach-Object { Write-Host "  $($_.KB) - $($_.Date.ToShortDateString()) (25H2? $($_.Is25H2))" }
 
-	return $recent[0].KB
+	# Prefer the first candidate (newest) that explicitly references 25H2 in its segment
+	$first25 = $recent | Where-Object { $_.Is25H2 } | Select-Object -First 1
+	if ($first25) { return $first25.KB }
+
+	Write-Host "No update-history candidates explicitly mentioning 25H2; returning null to allow catalog fallback." -ForegroundColor Yellow
+	return $null
 }
 
 function Find-PackageByKBOnDrive {
@@ -215,7 +223,10 @@ if ($kbFromHistory) {
 			Write-Host "Could not find updateid for $kbFromHistory in catalog; falling back to any package on drive" -ForegroundColor Yellow
 			$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
 			if ($packageOnDrive) { $packagePath = $packageOnDrive }
-			else { throw "Failed to locate any package to install. Manual download required." }
+			else {
+				if ($WhatIf) { Write-Host "WhatIf: no package on drive for $kbFromHistory; would require manual download." -ForegroundColor Yellow; exit 0 }
+				else { throw "Failed to locate any package to install. Manual download required." }
+			}
 		}
 		else {
 			$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $updateId
@@ -259,6 +270,16 @@ else {
 		else {
 			throw "No package found on $SourceDrive and update-history/catalog lookup provided no candidate. Manual download required."
 		}
+	}
+}
+
+if (-not $packagePath) {
+	if ($WhatIf) {
+		Write-Host "WhatIf: no package was located. Script would have required a manual download or further catalog investigation." -ForegroundColor Yellow
+		exit 0
+	}
+	else {
+		throw "No package located to install. Manual download required."
 	}
 }
 
