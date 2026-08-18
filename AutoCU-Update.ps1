@@ -96,6 +96,7 @@ function Get-LatestKBFromUpdateHistory {
 
 	Write-Host "Checking Windows 11 update-history page: $UpdateHistoryUrl"
 	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 		$resp = Invoke-WebRequest -Uri $UpdateHistoryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
 	}
 	catch {
@@ -104,33 +105,41 @@ function Get-LatestKBFromUpdateHistory {
 	}
 
 	$content = $resp.Content
-
-	# Look for KB IDs and nearby dates. We'll try two patterns: 'Month Day, Year' near KB and ISO dates
 	$results = @()
 
-	$pattern1 = '([A-Za-z]+\s+\d{1,2},\s+\d{4}).{0,200}?KB(\d{6,7})'
-	foreach ($m in [regex]::Matches($content, $pattern1)) {
-		$dateText = $m.Groups[1].Value
-		$kb = 'KB' + $m.Groups[2].Value
-		if ([datetime]::TryParse($dateText, [ref]$d)) {
-			$results += [pscustomobject]@{ KB = $kb; Date = $d }
+	# Find every KB occurrence and try to locate a nearby date (within 500 chars before the KB)
+	$kbMatches = [regex]::Matches($content, 'KB\d{6,7}') | ForEach-Object { $_.Value } | Select-Object -Unique
+	foreach ($kb in $kbMatches) {
+		$pos = $content.IndexOf($kb)
+		if ($pos -lt 0) { continue }
+		$start = [Math]::Max(0, $pos - 500)
+		$length = [Math]::Min(500 + $kb.Length, $content.Length - $start)
+		$segment = $content.Substring($start, $length)
+
+		# Try common date formats near the KB
+		$dateMatch = [regex]::Match($segment, '([A-Za-z]+\s+\d{1,2},\s+\d{4})|((?:20)\d{2}-\d{2}-\d{2})')
+		if ($dateMatch.Success) {
+			$dateText = $dateMatch.Value
+			if ([datetime]::TryParse($dateText, [ref]$d)) {
+				$results += [pscustomobject]@{ KB = $kb; Date = $d }
+			}
 		}
 	}
 
-	$pattern2 = 'KB(\d{6,7}).{0,200}?([A-Za-z]+\s+\d{1,2},\s+\d{4})'
-	foreach ($m in [regex]::Matches($content, $pattern2)) {
-		$kb = 'KB' + $m.Groups[1].Value
-		$dateText = $m.Groups[2].Value
-		if ([datetime]::TryParse($dateText, [ref]$d)) {
-			$results += [pscustomobject]@{ KB = $kb; Date = $d }
-		}
+	if ($results.Count -eq 0) {
+		Write-Host "No KB entries with nearby dates found on update-history page." -ForegroundColor Yellow
+		return $null
 	}
-
-	if ($results.Count -eq 0) { return $null }
 
 	$threshold = (Get-Date).AddDays(-$DaysBack)
-	$recent = $results | Where-Object { $_.Date -ge $threshold } | Sort-Object Date -Descending
-	if ($recent.Count -eq 0) { return $null }
+	$recent = $results | Sort-Object Date -Descending | Where-Object { $_.Date -ge $threshold }
+	if ($recent.Count -eq 0) {
+		Write-Host "Found KBs but none within the last $DaysBack days." -ForegroundColor Yellow
+		return $null
+	}
+
+	Write-Host "Update-history candidates:" -ForegroundColor Cyan
+	$recent | ForEach-Object { Write-Host "  $($_.KB) - $($_.Date.ToShortDateString())" }
 
 	return $recent[0].KB
 }
