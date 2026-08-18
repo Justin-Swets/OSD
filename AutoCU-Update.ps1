@@ -3,7 +3,8 @@ param(
 	[string]$SourceDrive = 'E:',
 	[string]$DestinationPath = 'E:\Latest-CU',
 	[string]$TargetRoot = 'C:\',
-	[string]$SearchQuery = 'Cumulative Update for Windows 11, version 25H2 x64'
+	[string]$SearchQuery = 'Cumulative Update for Windows 11, version 25H2 x64',
+	[switch]$WhatIf
 )
 
 $ErrorActionPreference = 'Stop'
@@ -189,7 +190,12 @@ function Install-CumulativeUpdate {
 
 	$logPath = Join-Path $TargetRoot 'Windows\Logs\AutoCU-install.log'
 	Write-Host "Installing update package from $PackagePath"
-	dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath
+	if ($WhatIf) {
+		Write-Host "WhatIf: would run: dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath"
+	}
+	else {
+		dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath
+	}
 }
 
 
@@ -220,14 +226,39 @@ if ($kbFromHistory) {
 	}
 }
 else {
-	Write-Host "Update-history parsing failed or no recent CU found; using most-recent package on flash drive."
-	$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
-	if ($packageOnDrive) {
-		Write-Host "Found package on source drive: $packageOnDrive"
-		$packagePath = $packageOnDrive
+	Write-Host "Update-history parsing failed or no recent CU found; attempting catalog search as fallback."
+	# Try Update Catalog fallback using broad SearchQuery
+	try {
+		$updateId = Get-UpdateIdFromSearchPage -Query $SearchQuery
+	}
+	catch {
+		$updateId = $null
+	}
+
+	if ($updateId) {
+		Write-Host "Found updateid from catalog search: $updateId"
+		$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $updateId
+		if ($fileUrl) {
+			$packagePath = Download-UpdatePackage -Url $fileUrl -DestinationDir $DestinationPath
+			Write-Host "Downloaded package to $packagePath"
+		}
+		else {
+			Write-Host "Catalog search returned updateid but no direct download URL. Falling back to flash-drive packages." -ForegroundColor Yellow
+			$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
+			if ($packageOnDrive) { $packagePath = $packageOnDrive }
+			else { throw "No package found on $SourceDrive and catalog fallback failed. Manual download required." }
+		}
 	}
 	else {
-		throw "No package found on $SourceDrive and update-history lookup provided no candidate. Manual download required."
+		Write-Host "Catalog search did not return an updateid; using most-recent package on flash drive." -ForegroundColor Yellow
+		$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
+		if ($packageOnDrive) {
+			Write-Host "Found package on source drive: $packageOnDrive"
+			$packagePath = $packageOnDrive
+		}
+		else {
+			throw "No package found on $SourceDrive and update-history/catalog lookup provided no candidate. Manual download required."
+		}
 	}
 }
 
