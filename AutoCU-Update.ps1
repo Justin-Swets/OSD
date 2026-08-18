@@ -4,7 +4,11 @@ param(
 	[string]$DestinationPath = 'E:\Latest-CU',
 	[string]$TargetRoot = 'C:\',
 	[string]$SearchQuery = 'Cumulative Update for Windows 11, version 25H2 x64',
-	[switch]$WhatIf
+	[ValidateSet('All','Find','Download','Install')][string]$Mode = 'All',
+	[string]$KB,
+	[string]$PackagePath,
+	[switch]$WhatIf,
+	[switch]$OpenCatalog
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,20 +44,51 @@ function Find-PackagesOnDrive {
 function Get-UpdateIdFromSearchPage {
 	param([string]$Query)
 
-	$searchUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($Query)
-	Write-Host "Querying Microsoft Update Catalog: $searchUrl"
+	$searchUrls = @(
+		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($Query),
+		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString("$Query x64"),
+		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString("$Query Windows 11")
+	)
 
-	try {
-		$resp = Invoke-WebRequest -Uri $searchUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+	foreach ($searchUrl in $searchUrls) {
+		Write-Host "Querying Microsoft Update Catalog: $searchUrl"
+		try {
+			$resp = Invoke-WebRequest -Uri $searchUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+		}
+		catch {
+			Write-Host ("Catalog query failed for {0}: {1}" -f $searchUrl, $_.Exception.Message) -ForegroundColor Yellow
+			continue
+		}
+
+		$content = $resp.Content
+
+		# Try multiple extraction patterns for updateid
+		$patterns = @(
+			'updateid=([0-9A-Fa-f\-]{36})',
+			'updateid%3d([0-9A-Fa-f\-]{36})',
+			'"updateid"\s*:\s*"([0-9A-Fa-f\-]{36})"',
+			'data-updateid="([0-9A-Fa-f\-]{36})"',
+			'ScopedViewInline.aspx\?updateid=([0-9A-Fa-f\-]{36})'
+		)
+
+		foreach ($pat in $patterns) {
+			$m = [regex]::Matches($content, $pat, 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+			if ($m -and $m.Count -gt 0) { return $m[0] }
+		}
+
+		# As a last resort, look for GUID-like strings near the KB number
+		$kbPattern = [regex]::Escape($Query)
+		$pos = $content.IndexOf($Query)
+		if ($pos -ge 0) {
+			$start = [Math]::Max(0, $pos - 400)
+			$len = [Math]::Min(800, $content.Length - $start)
+			$seg = $content.Substring($start, $len)
+			$guidMatch = [regex]::Match($seg, '([0-9A-Fa-f]{8}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{12})')
+			if ($guidMatch.Success) { return $guidMatch.Groups[1].Value }
+		}
 	}
-	catch {
-		throw "Failed to query Microsoft Update Catalog: $($_.Exception.Message)"
-	}
 
-	$matches = [regex]::Matches($resp.Content, 'updateid=([0-9A-Fa-f\-]{36})') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
-	if (-not $matches -or $matches.Count -eq 0) { return $null }
-
-	return $matches[0]
+	return $null
 }
 
 function Get-DownloadUrlFromUpdateId {
@@ -66,22 +101,73 @@ function Get-DownloadUrlFromUpdateId {
 		$resp = Invoke-WebRequest -Uri $viewUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
 	}
 	catch {
-		throw "Failed to fetch update detail page: $($_.Exception.Message)"
+		throw ("Failed to fetch update detail page: {0}" -f $_.Exception.Message)
 	}
 
-	# Look for direct download links hosted on download.windowsupdate.com ending in .msu or .cab
-	$msuMatch = [regex]::Match($resp.Content, '(https?://download\.windowsupdate\.com/[^"'']+?\.(msu|cab))', 'IgnoreCase')
-	if ($msuMatch.Success) { return $msuMatch.Groups[1].Value }
+	$content = $resp.Content
 
-	# As a fallback, try to find any href that looks like a download dialog and follow it
-	$dlgMatch = [regex]::Match($resp.Content, 'href\s*=\s*"([^"]*DownloadDialog\.aspx[^\"]*)"', 'IgnoreCase')
+	# Primary: look for direct download links hosted on download.windowsupdate.com ending in .msu or .cab
+	$patterns = @(
+		'(https?://download\.windowsupdate\.com/[^"'']+?\.(msu|cab))',
+		'data-downloadlink="(https?://download\.windowsupdate\.com/[^"]+?)"',
+		'"downloadUrl"\s*:\s*"(https?://download\.windowsupdate\.com/[^"]+?)"'
+	)
+
+	foreach ($pat in $patterns) {
+		$m = [regex]::Match($content, $pat, 'IgnoreCase')
+		if ($m.Success) { return $m.Groups[1].Value }
+	}
+
+	# If not found, attempt to follow any DownloadDialog link from the scoped view
+	$dlgMatch = [regex]::Match($content, 'href\s*=\s*"([^"]*DownloadDialog\.aspx[^\"]*)"', 'IgnoreCase')
 	if ($dlgMatch.Success) {
 		$dlg = $dlgMatch.Groups[1].Value
 		if ($dlg -notmatch '^http') { $dlg = 'https://www.catalog.update.microsoft.com' + $dlg }
 		try {
-			$dlgResp = Invoke-WebRequest -Uri $dlg -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-			$msuMatch2 = [regex]::Match($dlgResp.Content, '(https?://download\.windowsupdate\.com/[^"'']+?\.(msu|cab))', 'IgnoreCase')
-			if ($msuMatch2.Success) { return $msuMatch2.Groups[1].Value }
+			$dlgResp = Invoke-WebRequest -Uri $dlg -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl }
+			$dlgContent = $dlgResp.Content
+			foreach ($pat in $patterns) {
+				$m2 = [regex]::Match($dlgContent, $pat, 'IgnoreCase')
+				if ($m2.Success) { return $m2.Groups[1].Value }
+			}
+		}
+		catch { }
+	}
+
+	# Try DownloadDialog.aspx directly with common query patterns and a Referer/cookie container
+	$tryUrls = @(
+		"https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$UpdateId",
+		"https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$UpdateId&ln=en-US"
+	)
+
+	$wc = New-Object System.Net.CookieContainer
+	foreach ($u in $tryUrls) {
+		try {
+			$dlgResp2 = Invoke-WebRequest -Uri $u -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl } -WebSession @{ CookieContainer = $wc }  -ErrorAction Stop
+		}
+		catch {
+			# Some environments block this, continue to next attempt
+			continue
+		}
+		$dlgContent2 = $dlgResp2.Content
+		foreach ($pat in $patterns) {
+			$m3 = [regex]::Match($dlgContent2, $pat, 'IgnoreCase')
+			if ($m3.Success) { return $m3.Groups[1].Value }
+		}
+	}
+
+	# Last resort: look for any GUID-prefixed resources in the scoped view and attempt to construct a download dialog
+	$guidMatch = [regex]::Match($content, '([0-9A-Fa-f]{8}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{12})')
+	if ($guidMatch.Success) {
+		$tryGuid = $guidMatch.Groups[1].Value
+		$tryUrl = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$tryGuid"
+		try {
+			$tryResp = Invoke-WebRequest -Uri $tryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl }
+			$tryContent = $tryResp.Content
+			foreach ($pat in $patterns) {
+				$m4 = [regex]::Match($tryContent, $pat, 'IgnoreCase')
+				if ($m4.Success) { return $m4.Groups[1].Value }
+			}
 		}
 		catch { }
 	}
@@ -153,6 +239,81 @@ function Get-LatestKBFromUpdateHistory {
 	return $null
 }
 
+function Get-RecentKBCandidates {
+	param(
+		[string]$UpdateHistoryUrl = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history',
+		[int]$DaysBack = 30
+	)
+
+	try {
+		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+		$resp = Invoke-WebRequest -Uri $UpdateHistoryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
+	}
+	catch {
+		Write-Host "Failed to fetch update-history page: $($_.Exception.Message)" -ForegroundColor Yellow
+		return @()
+	}
+
+	$content = $resp.Content
+	$results = @()
+
+	$kbMatches = [regex]::Matches($content, 'KB\d{6,7}') | ForEach-Object { $_.Value } | Select-Object -Unique
+	foreach ($kb in $kbMatches) {
+		$pos = $content.IndexOf($kb)
+		if ($pos -lt 0) { continue }
+		$start = [Math]::Max(0, $pos - 500)
+		$length = [Math]::Min(500 + $kb.Length, $content.Length - $start)
+		$segment = $content.Substring($start, $length)
+		$dateMatch = [regex]::Match($segment, '([A-Za-z]+\s+\d{1,2},\s+\d{4})|((?:20)\d{2}-\d{2}-\d{2})')
+		if ($dateMatch.Success) {
+			$dateText = $dateMatch.Value
+			try {
+				$d = [datetime]::Parse($dateText)
+				$is25 = $segment -match '25H2|version\s*25H2|25-H2'
+				$results += [pscustomobject]@{ KB = $kb; Date = $d; Segment = $segment; Is25H2 = $is25 }
+			}
+			catch { }
+		}
+	}
+
+	$threshold = (Get-Date).AddDays(-$DaysBack)
+	$recent = $results | Where-Object { $_.Date -ge $threshold } | Sort-Object Date -Descending
+	return $recent
+}
+
+function Get-DownloadUrlForKBWithRetries {
+	param(
+		[string]$KB,
+		[int]$Attempts = 3,
+		[int]$DelaySeconds = 2
+	)
+
+	$queries = @("$KB Windows 11 25H2", "$KB Windows 11", "$KB")
+	foreach ($q in $queries) {
+		for ($i = 1; $i -le $Attempts; $i++) {
+			try {
+				$uid = Get-UpdateIdFromSearchPage -Query $q
+			}
+			catch { $uid = $null }
+
+			if ($uid) {
+				for ($j = 1; $j -le $Attempts; $j++) {
+					try {
+						$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $uid
+						if ($fileUrl) { return $fileUrl }
+					}
+					catch { }
+					Start-Sleep -Seconds $DelaySeconds
+				}
+			}
+
+			Start-Sleep -Seconds $DelaySeconds
+		}
+	}
+
+	return $null
+}
+
 function Find-PackageByKBOnDrive {
 	param(
 		[string]$RootPath,
@@ -206,6 +367,51 @@ function Install-CumulativeUpdate {
 	}
 }
 
+# High-level part 1: find the current CU KB ID
+function Find-CurrentCUKB {
+	param([int]$DaysBack = 30)
+	return Get-LatestKBFromUpdateHistory -DaysBack $DaysBack
+}
+
+# High-level part 2: download the .msu for a KB (uses existing helpers)
+function Download-MSUForKB {
+	param(
+		[Parameter(Mandatory=$true)][string]$KBToGet,
+		[string]$DestinationDir = $DestinationPath
+	)
+
+	# Check flash for matching package first
+	$existing = Find-PackageByKBOnDrive -RootPath $SourceDrive -KB $KBToGet
+	if ($existing) { Write-Host "Found $KBToGet on drive: $existing"; return $existing }
+
+	# Try to get direct download URL via catalog
+	$fileUrl = Get-DownloadUrlForKBWithRetries -KB $KBToGet -Attempts 3 -DelaySeconds 2
+	if (-not $fileUrl) {
+		$browseUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($KBToGet)
+		Write-Host "Could not automatically locate .msu for $KBToGet. Catalog: $browseUrl" -ForegroundColor Yellow
+		if ($OpenCatalog) { try { Start-Process -FilePath $browseUrl } catch { Write-Host "Unable to open browser." -ForegroundColor Yellow } }
+		return $null
+	}
+
+	$fileName = Split-Path -Path $fileUrl -Leaf
+	$destPath = Join-Path $DestinationDir $fileName
+	if ($WhatIf) {
+		Write-Host "WhatIf: would download $fileUrl -> $destPath"
+		return $destPath
+	}
+
+	return Download-UpdatePackage -Url $fileUrl -DestinationDir $DestinationDir
+}
+
+# High-level part 3: apply the msu with DISM
+function Apply-MSUWithDISM {
+	param(
+		[Parameter(Mandatory=$true)][string]$MSUPath,
+		[string]$Target = $TargetRoot
+	)
+	Install-CumulativeUpdate -PackagePath $MSUPath -TargetRoot $Target
+}
+
 
 # Main flow: prefer update-history page
 $kbFromHistory = Get-LatestKBFromUpdateHistory
@@ -257,7 +463,16 @@ else {
 			Write-Host "Catalog search returned updateid but no direct download URL. Falling back to flash-drive packages." -ForegroundColor Yellow
 			$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
 			if ($packageOnDrive) { $packagePath = $packageOnDrive }
-			else { throw "No package found on $SourceDrive and catalog fallback failed. Manual download required." }
+			else {
+				if ($OpenCatalog) {
+					$browseUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($kbFromHistory)
+					Write-Host "Opening catalog search page for manual download: $browseUrl"
+					try { Start-Process -FilePath $browseUrl } catch { Write-Host "Unable to open browser in this environment." -ForegroundColor Yellow }
+					if ($WhatIf) { exit 0 }
+					throw "Catalog fallback failed; opened catalog page for manual download."
+				}
+				else { throw "No package found on $SourceDrive and catalog fallback failed. Manual download required." }
+			}
 		}
 	}
 	else {
