@@ -1,504 +1,626 @@
+<#
+.SYNOPSIS
+    Finds, downloads, and applies the latest Windows 11 25H2 cumulative update.
+
+.DESCRIPTION
+    Part 1  Scrapes the Windows 11 25H2 update-history page for the newest CU,
+            identified by OS Build 26200.x. Monthly and Out-of-band releases are
+            eligible; Preview (C-release) entries are excluded unless -IncludePreview.
+    Part 2  Resolves that KB to a Microsoft Update Catalog row for the requested
+            architecture and downloads the .msu/.cab.
+    Part 3  Applies the package to an OFFLINE Windows image with DISM.
+
+.NOTES
+    25H2 and 24H2 ship under the SAME KB (e.g. KB5121003 = builds 26200.9168 and
+    26100.9168) but as SEPARATE catalog packages. Selection is therefore filtered on
+    the catalog title's "version 25H2" and "<arch>-based" text, not on the KB alone.
+
+    Install is offline-only (dism /Image). Run from WinPE. DISM rejects /Image against
+    the running OS, so this script fails fast in that case.
+
+.EXAMPLE
+    .\AutoCU-Update.ps1 -Mode Find
+
+.EXAMPLE
+    .\AutoCU-Update.ps1 -Mode Download -Architecture x64,arm64 -DestinationPath E:\Latest-CU
+
+.EXAMPLE
+    .\AutoCU-Update.ps1 -Mode All -Architecture arm64 -TargetRoot C:\
+#>
 [CmdletBinding()]
 param(
-	[string]$SourceDrive = 'E:',
-	[string]$DestinationPath = 'E:\Latest-CU',
-	[string]$TargetRoot = 'C:\',
-	[string]$SearchQuery = 'Cumulative Update for Windows 11, version 25H2 x64',
-	[ValidateSet('All','Find','Download','Install')][string]$Mode = 'All',
-	[string]$KB,
-	[string]$PackagePath,
-	[switch]$WhatIf,
-	[switch]$OpenCatalog
+    [string]$SourceDrive = 'E:',
+    [string]$DestinationPath = 'E:\Latest-CU',
+    [string]$TargetRoot = 'C:\',
+    [ValidateSet('All','Find','Download','Install')][string]$Mode = 'All',
+    [ValidateSet('x64','arm64')][string[]]$Architecture = @('x64'),
+    [string]$KB,
+    [string]$PackagePath,
+    [int]$DaysBack = 45,
+    [switch]$IncludePreview,
+    [switch]$SkipLocalSearch,
+    [switch]$WhatIf,
+    [switch]$OpenCatalog
 )
 
 $ErrorActionPreference = 'Stop'
+# CU packages are ~5 GB; the progress bar cripples Invoke-WebRequest throughput on PS 5.1.
+$ProgressPreference = 'SilentlyContinue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$Script:BuildFamily25H2 = '26200'
+$Script:HistoryUrl      = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history'
+$Script:CatalogBase     = 'https://www.catalog.update.microsoft.com'
+$Script:UserAgent       = 'Mozilla/5.0'
 
 function Ensure-Directory {
-	param([string]$Path)
-	if (-not (Test-Path -LiteralPath $Path)) {
-		New-Item -ItemType Directory -Path $Path -Force | Out-Null
-	}
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
 }
 
-function Find-PackagesOnDrive {
-	param([string]$RootPath)
+function Invoke-Page {
+    param([string]$Uri, [string]$Method = 'Get', $Body = $null, [string]$Referer)
 
-	if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
+    # Accept-Language reduces (but does not eliminate) the catalog serving localized titles.
+    $headers = @{ 'User-Agent' = $Script:UserAgent; 'Accept-Language' = 'en-US,en;q=0.9' }
+    if ($Referer) { $headers['Referer'] = $Referer }
 
-	$candidates = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
-		Where-Object {
-			($_.Extension -in '.msu','.cab') -and (
-				$_.Name -match 'KB\d{6,7}' -or
-				$_.Name -match 'Cumulative' -or
-				$_.Name -match 'Windows11|Win11|Windows_11'
-			)
-		}
+    $splat = @{ Uri = $Uri; UseBasicParsing = $true; Headers = $headers; TimeoutSec = 120; Method = $Method }
+    if ($null -ne $Body) { $splat['Body'] = $Body }
 
-	if ($candidates) {
-		return $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
-	}
-
-	return $null
+    return Invoke-WebRequest @splat
 }
 
-function Get-UpdateIdFromSearchPage {
-	param([string]$Query)
-
-	$searchUrls = @(
-		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($Query),
-		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString("$Query x64"),
-		"https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString("$Query Windows 11")
-	)
-
-	foreach ($searchUrl in $searchUrls) {
-		Write-Host "Querying Microsoft Update Catalog: $searchUrl"
-		try {
-			$resp = Invoke-WebRequest -Uri $searchUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-		}
-		catch {
-			Write-Host ("Catalog query failed for {0}: {1}" -f $searchUrl, $_.Exception.Message) -ForegroundColor Yellow
-			continue
-		}
-
-		$content = $resp.Content
-
-		# Try multiple extraction patterns for updateid
-		$patterns = @(
-			'updateid=([0-9A-Fa-f\-]{36})',
-			'updateid%3d([0-9A-Fa-f\-]{36})',
-			'"updateid"\s*:\s*"([0-9A-Fa-f\-]{36})"',
-			'data-updateid="([0-9A-Fa-f\-]{36})"',
-			'ScopedViewInline.aspx\?updateid=([0-9A-Fa-f\-]{36})'
-		)
-
-		foreach ($pat in $patterns) {
-			$m = [regex]::Matches($content, $pat, 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
-			if ($m -and $m.Count -gt 0) { return $m[0] }
-		}
-
-		# As a last resort, look for GUID-like strings near the KB number
-		$kbPattern = [regex]::Escape($Query)
-		$pos = $content.IndexOf($Query)
-		if ($pos -ge 0) {
-			$start = [Math]::Max(0, $pos - 400)
-			$len = [Math]::Min(800, $content.Length - $start)
-			$seg = $content.Substring($start, $len)
-			$guidMatch = [regex]::Match($seg, '([0-9A-Fa-f]{8}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{12})')
-			if ($guidMatch.Success) { return $guidMatch.Groups[1].Value }
-		}
-	}
-
-	return $null
+function ConvertFrom-HtmlCell {
+    param([string]$Html)
+    return (($Html -replace '<[^>]+>', ' ') -replace '&nbsp;', ' ' -replace '\s+', ' ').Trim()
 }
 
-function Get-DownloadUrlFromUpdateId {
-	param([string]$UpdateId)
+#region Part 1 - discover the current CU from the update-history page
 
-	$viewUrl = "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx?updateid=$UpdateId"
-	Write-Host "Fetching update details: $viewUrl"
+function Get-CUHistoryEntry {
+    <#
+        The 25H2 history page embeds EVERY Windows 11 servicing branch (22000, 22621,
+        22631, 26100, 26200, 28000), and the 26H1 (28000) block appears FIRST in the
+        markup. Document order is therefore meaningless - entries must be filtered on
+        the 26200 build family. Each entry is also emitted twice, so results are deduped.
 
-	try {
-		$resp = Invoke-WebRequest -Uri $viewUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-	}
-	catch {
-		throw ("Failed to fetch update detail page: {0}" -f $_.Exception.Message)
-	}
+        Heading format on the page:
+            August 11, 2026-KB5121003 (OS Builds 26200.9168 and 26100.9168)
+            July 28, 2026-KB5101684 (OS Builds 26200.8973 and 26100.8973) Preview
+            July 18, 2026-KB5121767 (OS Builds 26200.8894 and 26100.8894) Out-of-band
+    #>
+    param(
+        [string]$Url = $Script:HistoryUrl,
+        [switch]$IncludePreview
+    )
 
-	$content = $resp.Content
+    Write-Host "Reading Windows 11 25H2 update history: $Url"
+    try {
+        $resp = Invoke-Page -Uri $Url
+    }
+    catch {
+        Write-Host "Failed to fetch update-history page: $($_.Exception.Message)" -ForegroundColor Yellow
+        return @()
+    }
 
-	# Primary: look for direct download links hosted on download.windowsupdate.com ending in .msu or .cab
-	$patterns = @(
-		'(https?://download\.windowsupdate\.com/[^"'']+?\.(msu|cab))',
-		'data-downloadlink="(https?://download\.windowsupdate\.com/[^"]+?)"',
-		'"downloadUrl"\s*:\s*"(https?://download\.windowsupdate\.com/[^"]+?)"'
-	)
+    $pattern = '(?<date>[A-Z][a-z]+ \d{1,2}, \d{4})[^<]{0,20}?KB(?<kb>\d{6,7})\s*\(OS Builds?\s*' +
+               $Script:BuildFamily25H2 + '\.(?<rev>\d+)[^)]*\)(?<tag>[^<]{0,24})'
 
-	foreach ($pat in $patterns) {
-		$m = [regex]::Match($content, $pat, 'IgnoreCase')
-		if ($m.Success) { return $m.Groups[1].Value }
-	}
+    $seen    = @{}
+    $entries = New-Object System.Collections.Generic.List[object]
 
-	# If not found, attempt to follow any DownloadDialog link from the scoped view
-	$dlgMatch = [regex]::Match($content, 'href\s*=\s*"([^"]*DownloadDialog\.aspx[^\"]*)"', 'IgnoreCase')
-	if ($dlgMatch.Success) {
-		$dlg = $dlgMatch.Groups[1].Value
-		if ($dlg -notmatch '^http') { $dlg = 'https://www.catalog.update.microsoft.com' + $dlg }
-		try {
-			$dlgResp = Invoke-WebRequest -Uri $dlg -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl }
-			$dlgContent = $dlgResp.Content
-			foreach ($pat in $patterns) {
-				$m2 = [regex]::Match($dlgContent, $pat, 'IgnoreCase')
-				if ($m2.Success) { return $m2.Groups[1].Value }
-			}
-		}
-		catch { }
-	}
+    foreach ($m in [regex]::Matches($resp.Content, $pattern)) {
+        $kbId = 'KB' + $m.Groups['kb'].Value
+        if ($seen.ContainsKey($kbId)) { continue }
+        $seen[$kbId] = $true
 
-	# Try DownloadDialog.aspx directly with common query patterns and a Referer/cookie container
-	$tryUrls = @(
-		"https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$UpdateId",
-		"https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$UpdateId&ln=en-US"
-	)
+        $tag  = $m.Groups['tag'].Value
+        $type = if     ($tag -match 'Preview')     { 'Preview' }
+                elseif ($tag -match 'Out-of-band') { 'OutOfBand' }
+                else                               { 'Monthly' }
 
-	$wc = New-Object System.Net.CookieContainer
-	foreach ($u in $tryUrls) {
-		try {
-			$dlgResp2 = Invoke-WebRequest -Uri $u -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl } -WebSession @{ CookieContainer = $wc }  -ErrorAction Stop
-		}
-		catch {
-			# Some environments block this, continue to next attempt
-			continue
-		}
-		$dlgContent2 = $dlgResp2.Content
-		foreach ($pat in $patterns) {
-			$m3 = [regex]::Match($dlgContent2, $pat, 'IgnoreCase')
-			if ($m3.Success) { return $m3.Groups[1].Value }
-		}
-	}
+        $parsedDate = $null
+        try {
+            $parsedDate = [datetime]::Parse($m.Groups['date'].Value, [Globalization.CultureInfo]::GetCultureInfo('en-US'))
+        }
+        catch { }
 
-	# Last resort: look for any GUID-prefixed resources in the scoped view and attempt to construct a download dialog
-	$guidMatch = [regex]::Match($content, '([0-9A-Fa-f]{8}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{4}\-[0-9A-Fa-f]{12})')
-	if ($guidMatch.Success) {
-		$tryGuid = $guidMatch.Groups[1].Value
-		$tryUrl = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx?updateid=$tryGuid"
-		try {
-			$tryResp = Invoke-WebRequest -Uri $tryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0'; 'Referer' = $viewUrl }
-			$tryContent = $tryResp.Content
-			foreach ($pat in $patterns) {
-				$m4 = [regex]::Match($tryContent, $pat, 'IgnoreCase')
-				if ($m4.Success) { return $m4.Groups[1].Value }
-			}
-		}
-		catch { }
-	}
+        $entries.Add([pscustomobject]@{
+            KB          = $kbId
+            Date        = $parsedDate
+            Build       = "$($Script:BuildFamily25H2).$($m.Groups['rev'].Value)"
+            Revision    = [int]$m.Groups['rev'].Value
+            ReleaseType = $type
+        })
+    }
 
-	return $null
+    if ($entries.Count -eq 0) {
+        Write-Host "No $($Script:BuildFamily25H2).x entries parsed from the update-history page. Layout may have changed." -ForegroundColor Yellow
+        return @()
+    }
+
+    $eligible = if ($IncludePreview) { $entries } else { $entries | Where-Object { $_.ReleaseType -ne 'Preview' } }
+
+    # Sort on build revision: monotonic, and independent of date parsing.
+    return @($eligible | Sort-Object Revision -Descending)
 }
 
-function Get-LatestKBFromUpdateHistory {
-	param(
-		[string]$UpdateHistoryUrl = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history',
-		[int]$DaysBack = 30
-	)
+function Get-LatestCU {
+    param([int]$DaysBack = 45, [switch]$IncludePreview)
 
-	Write-Host "Checking Windows 11 update-history page: $UpdateHistoryUrl"
-	try {
-		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-		$resp = Invoke-WebRequest -Uri $UpdateHistoryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-	}
-	catch {
-		Write-Host "Failed to fetch update-history page: $($_.Exception.Message)" -ForegroundColor Yellow
-		return $null
-	}
+    $entries = Get-CUHistoryEntry -IncludePreview:$IncludePreview
+    if ($entries.Count -eq 0) { return $null }
 
-	$content = $resp.Content
-	$results = @()
+    Write-Host "25H2 candidates (newest first):" -ForegroundColor Cyan
+    $entries | Select-Object -First 5 | ForEach-Object {
+        $d = if ($_.Date) { $_.Date.ToString('yyyy-MM-dd') } else { 'unknown' }
+        Write-Host ("  {0}  {1}  build {2}  [{3}]" -f $_.KB, $d, $_.Build, $_.ReleaseType)
+    }
 
-	# Find every KB occurrence and try to locate a nearby date (within 500 chars before the KB)
-	$kbMatches = [regex]::Matches($content, 'KB\d{6,7}') | ForEach-Object { $_.Value } | Select-Object -Unique
-	foreach ($kb in $kbMatches) {
-		$pos = $content.IndexOf($kb)
-		if ($pos -lt 0) { continue }
-		$start = [Math]::Max(0, $pos - 500)
-		$length = [Math]::Min(500 + $kb.Length, $content.Length - $start)
-		$segment = $content.Substring($start, $length)
+    $latest = $entries[0]
 
-		# Try common date formats near the KB
-		$dateMatch = [regex]::Match($segment, '([A-Za-z]+\s+\d{1,2},\s+\d{4})|((?:20)\d{2}-\d{2}-\d{2})')
-		if ($dateMatch.Success) {
-			$dateText = $dateMatch.Value
-			try {
-				$d = [datetime]::Parse($dateText)
-				$is25 = $segment -match '25H2|version\s*25H2|25-H2'
-				$results += [pscustomobject]@{ KB = $kb; Date = $d; Segment = $segment; Is25H2 = $is25 }
-			}
-			catch { }
-		}
-	}
+    # Staleness is a warning, not a hard filter. Returning $null on a stale page is what
+    # made the previous version fall through to an unrelated package on the flash drive.
+    if ($latest.Date -and $latest.Date -lt (Get-Date).AddDays(-$DaysBack)) {
+        Write-Host ("WARNING: newest 25H2 CU ({0}, {1}) is older than {2} days. Proceeding anyway." -f
+                    $latest.KB, $latest.Date.ToString('yyyy-MM-dd'), $DaysBack) -ForegroundColor Yellow
+    }
 
-	if ($results.Count -eq 0) {
-		Write-Host "No KB entries with nearby dates found on update-history page." -ForegroundColor Yellow
-		return $null
-	}
-
-	$threshold = (Get-Date).AddDays(-$DaysBack)
-	$recent = $results | Sort-Object Date -Descending | Where-Object { $_.Date -ge $threshold }
-	if ($recent.Count -eq 0) {
-		Write-Host "Found KBs but none within the last $DaysBack days." -ForegroundColor Yellow
-		return $null
-	}
-
-	Write-Host "Update-history candidates:" -ForegroundColor Cyan
-	$recent | ForEach-Object { Write-Host "  $($_.KB) - $($_.Date.ToShortDateString()) (25H2? $($_.Is25H2))" }
-
-	# Prefer the first candidate (newest) that explicitly references 25H2 in its segment
-	$first25 = $recent | Where-Object { $_.Is25H2 } | Select-Object -First 1
-	if ($first25) { return $first25.KB }
-
-	Write-Host "No update-history candidates explicitly mentioning 25H2; returning null to allow catalog fallback." -ForegroundColor Yellow
-	return $null
+    return $latest
 }
 
-function Get-RecentKBCandidates {
-	param(
-		[string]$UpdateHistoryUrl = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history',
-		[int]$DaysBack = 30
-	)
+#endregion
 
-	try {
-		[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-		$resp = Invoke-WebRequest -Uri $UpdateHistoryUrl -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-	}
-	catch {
-		Write-Host "Failed to fetch update-history page: $($_.Exception.Message)" -ForegroundColor Yellow
-		return @()
-	}
+#region Part 2 - resolve the KB in the Update Catalog and download
 
-	$content = $resp.Content
-	$results = @()
+function Get-CatalogUpdateRow {
+    <#
+        Catalog search results are an ASP.NET table. A row's updateId is the GUID in the
+        cell id attribute: id="<guid>_C1_R<n>" is the title cell and id="<guid>_C6_R<n>"
+        carries the size in bytes. The catalog does NOT emit "updateid=<guid>" anywhere
+        in the search markup - that pattern matches zero times.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$KB,
+        [string]$Version = '25H2',
+        [Parameter(Mandatory=$true)][ValidateSet('x64','arm64')][string]$Arch
+    )
 
-	$kbMatches = [regex]::Matches($content, 'KB\d{6,7}') | ForEach-Object { $_.Value } | Select-Object -Unique
-	foreach ($kb in $kbMatches) {
-		$pos = $content.IndexOf($kb)
-		if ($pos -lt 0) { continue }
-		$start = [Math]::Max(0, $pos - 500)
-		$length = [Math]::Min(500 + $kb.Length, $content.Length - $start)
-		$segment = $content.Substring($start, $length)
-		$dateMatch = [regex]::Match($segment, '([A-Za-z]+\s+\d{1,2},\s+\d{4})|((?:20)\d{2}-\d{2}-\d{2})')
-		if ($dateMatch.Success) {
-			$dateText = $dateMatch.Value
-			try {
-				$d = [datetime]::Parse($dateText)
-				$is25 = $segment -match '25H2|version\s*25H2|25-H2'
-				$results += [pscustomobject]@{ KB = $kb; Date = $d; Segment = $segment; Is25H2 = $is25 }
-			}
-			catch { }
-		}
-	}
+    $url      = "$($Script:CatalogBase)/Search.aspx?q=" + [uri]::EscapeDataString($KB)
+    $attempts = 3
 
-	$threshold = (Get-Date).AddDays(-$DaysBack)
-	$recent = $results | Where-Object { $_.Date -ge $threshold } | Sort-Object Date -Descending
-	return $recent
+    for ($try = 1; $try -le $attempts; $try++) {
+        Write-Host "Querying Update Catalog: $url"
+
+        try { $resp = Invoke-Page -Uri $url }
+        catch {
+            Write-Host "Catalog query failed (attempt $try/$attempts): $($_.Exception.Message)" -ForegroundColor Yellow
+            if ($try -lt $attempts) { Start-Sleep -Seconds 3; continue }
+            return $null
+        }
+
+        $content = $resp.Content
+        $rows    = [regex]::Matches($content, '(?s)id="(?<guid>[0-9A-Fa-f\-]{36})_C1_R\d+"[^>]*>(?<title>.*?)</td>')
+
+        if ($rows.Count -eq 0) {
+            Write-Host "No catalog result rows found for $KB (attempt $try/$attempts)." -ForegroundColor Yellow
+            if ($try -lt $attempts) { Start-Sleep -Seconds 3; continue }
+            return $null
+        }
+
+        $found = New-Object System.Collections.Generic.List[object]
+
+        foreach ($row in $rows) {
+            $guid  = $row.Groups['guid'].Value
+            $title = ConvertFrom-HtmlCell -Html $row.Groups['title'].Value
+
+            # These filters are deliberately locale-invariant. The catalog intermittently
+            # serves localized titles - e.g. the Russian form renders "x64-based Systems"
+            # as "процессоров x64" - so matching English prose is unreliable. The KB, the
+            # build number and the bare architecture token survive translation, and the
+            # build number is what actually separates 25H2 (26200.x) from 24H2 (26100.x),
+            # which share the same KB.
+            $buildInTitle = [regex]::Match($title, '\((?<b>' + $Script:BuildFamily25H2 + '\.\d+)\)')
+
+            if ($title -notmatch [regex]::Escape($KB))                            { continue }
+            if (-not $buildInTitle.Success)                                       { continue }
+            if ($title -notmatch "(?<![a-z0-9])$Arch(?![a-z0-9])")                { continue }
+            if ($title -match 'Dynamic Update|\.NET Framework|server operating')  { continue }
+
+            $sizeCell = [regex]::Match($content, 'id="' + [regex]::Escape($guid) + '_C6_R\d+"[^>]*>(?<s>.*?)</td>', 'Singleline')
+            $bytes    = $null
+            if ($sizeCell.Success) {
+                $b = [regex]::Match((ConvertFrom-HtmlCell -Html $sizeCell.Groups['s'].Value), '(\d{6,})')
+                if ($b.Success) { $bytes = [int64]$b.Groups[1].Value }
+            }
+
+            $found.Add([pscustomobject]@{
+                UpdateId = $guid
+                Title    = $title
+                Bytes    = $bytes
+                Build    = $buildInTitle.Groups['b'].Value
+            })
+        }
+
+        if ($found.Count -gt 0) {
+            if ($found.Count -gt 1) {
+                Write-Host "Multiple matching rows; using the first:" -ForegroundColor Yellow
+                $found | ForEach-Object { Write-Host "  $($_.Title)" }
+            }
+            return $found[0]
+        }
+
+        Write-Host "$KB is in the catalog, but no row matched build $($Script:BuildFamily25H2).x + '$Arch' (attempt $try/$attempts)." -ForegroundColor Yellow
+        if ($try -lt $attempts) { Start-Sleep -Seconds 3 }
+    }
+
+    return $null
 }
 
-function Get-DownloadUrlForKBWithRetries {
-	param(
-		[string]$KB,
-		[int]$Attempts = 3,
-		[int]$DelaySeconds = 2
-	)
+function Get-CatalogDownloadFile {
+    <#
+        The download URLs are only obtainable by POSTing an updateIDs payload to
+        DownloadDialog.aspx. ScopedViewInline.aspx contains no .msu/.cab link and no
+        DownloadDialog reference at all. Files are served from *.delivery.mp.microsoft.com,
+        NOT from download.windowsupdate.com.
 
-	$queries = @("$KB Windows 11 25H2", "$KB Windows 11", "$KB")
-	foreach ($q in $queries) {
-		for ($i = 1; $i -le $Attempts; $i++) {
-			try {
-				$uid = Get-UpdateIdFromSearchPage -Query $q
-			}
-			catch { $uid = $null }
+        IMPORTANT: the dialog returns EVERY file the update requires, not just the CU.
+        For Windows 11 24H2/25H2 that includes the checkpoint baseline (KB5043080)
+        alongside the target CU, e.g. for KB5121003 x64:
 
-			if ($uid) {
-				for ($j = 1; $j -le $Attempts; $j++) {
-					try {
-						$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $uid
-						if ($fileUrl) { return $fileUrl }
-					}
-					catch { }
-					Start-Sleep -Seconds $DelaySeconds
-				}
-			}
+            windows11.0-kb5121003-x64_....msu   4867 MB  (target CU)
+            windows11.0-kb5043080-x64_....msu    509 MB  (checkpoint prerequisite)
 
-			Start-Sleep -Seconds $DelaySeconds
-		}
-	}
+        The order of those entries VARIES between requests, so files must be matched by
+        KB number - never by position. Returns them in DISM apply order: prerequisites
+        first, target CU last.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$UpdateId,
+        [Parameter(Mandatory=$true)][string]$KB
+    )
 
-	return $null
+    $payload = @{ size = 0; languages = ''; uidInfo = $UpdateId; updateID = $UpdateId }
+    $body    = @{ updateIDs = '[' + ($payload | ConvertTo-Json -Compress) + ']' }
+
+    try {
+        $resp = Invoke-Page -Uri "$($Script:CatalogBase)/DownloadDialog.aspx" -Method Post -Body $body -Referer "$($Script:CatalogBase)/Search.aspx"
+    }
+    catch {
+        Write-Host "DownloadDialog POST failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        return @()
+    }
+
+    $urls = [regex]::Matches($resp.Content, "downloadInformation\[\d+\]\.files\[\d+\]\.url\s*=\s*'([^']+)'") |
+                ForEach-Object { $_.Groups[1].Value } |
+                Where-Object   { $_ -match '\.(msu|cab)$' } |
+                Select-Object -Unique
+
+    if (-not $urls -or @($urls).Count -eq 0) {
+        Write-Host "No .msu/.cab URL in the DownloadDialog response for $UpdateId." -ForegroundColor Yellow
+        return @()
+    }
+
+    $kbDigits = $KB -replace '^KB', ''
+
+    $files = foreach ($u in @($urls)) {
+        $name  = Split-Path -Path ($u -split '\?')[0] -Leaf
+        $fileKB = if ($name -match 'kb(\d{6,7})') { 'KB' + $Matches[1] } else { $null }
+        [pscustomobject]@{
+            Url      = $u
+            FileName = $name
+            KB       = $fileKB
+            IsTarget = ($fileKB -eq "KB$kbDigits")
+        }
+    }
+
+    if (-not (@($files) | Where-Object { $_.IsTarget })) {
+        Write-Host "DownloadDialog returned files, but none matched ${KB}:" -ForegroundColor Yellow
+        @($files) | ForEach-Object { Write-Host "  $($_.FileName)" }
+        return @()
+    }
+
+    # Checkpoint/prerequisite packages must be applied before the target CU.
+    $prereqs = @(@($files) | Where-Object { -not $_.IsTarget } | Sort-Object KB)
+    $target  = @(@($files) | Where-Object { $_.IsTarget })
+
+    return @($prereqs + $target)
+}
+
+function Get-RemoteFileSize {
+    <#
+        Per-file Content-Length from the CDN. The catalog row's size column covers only
+        the primary CU, so it cannot be used to verify prerequisite files.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Url)
+
+    try {
+        $h   = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -Headers @{ 'User-Agent' = $Script:UserAgent } -TimeoutSec 120
+        $len = @($h.Headers['Content-Length'])[0]
+        if ($len) { return [int64]$len }
+    }
+    catch { }
+    return $null
+}
+
+function Save-UpdatePackage {
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$DestinationDir,
+        [int64]$ExpectedBytes
+    )
+
+    Ensure-Directory -Path $DestinationDir
+
+    $fileName = Split-Path -Path ($Url -split '\?')[0] -Leaf
+    $destPath = [IO.Path]::Combine($DestinationDir, $fileName)
+
+    if (Test-Path -LiteralPath $destPath) {
+        $existing = (Get-Item -LiteralPath $destPath).Length
+        if (-not $ExpectedBytes -or $existing -eq $ExpectedBytes) {
+            Write-Host "Already present ($([math]::Round($existing/1MB,1)) MB): $destPath"
+            return $destPath
+        }
+        Write-Host ("Existing file is {0} bytes but the catalog reports {1}; re-downloading." -f $existing, $ExpectedBytes) -ForegroundColor Yellow
+        Remove-Item -LiteralPath $destPath -Force
+    }
+
+    $sizeText = if ($ExpectedBytes) { " ($([math]::Round($ExpectedBytes/1MB,1)) MB)" } else { '' }
+    Write-Host "Downloading$sizeText -> $destPath"
+
+    # Download to .partial so an interrupted transfer is never mistaken for a good file.
+    $tmp = "$destPath.partial"
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -Headers @{ 'User-Agent' = $Script:UserAgent } -TimeoutSec 3600
+    }
+    catch {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        throw "Failed to download update package: $($_.Exception.Message)"
+    }
+
+    $got = (Get-Item -LiteralPath $tmp).Length
+    if ($ExpectedBytes -and $got -ne $ExpectedBytes) {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw "Download size mismatch: got $got bytes, expected $ExpectedBytes."
+    }
+
+    Move-Item -LiteralPath $tmp -Destination $destPath -Force
+    Write-Host "Downloaded: $destPath" -ForegroundColor Green
+    return $destPath
+}
+
+function Get-PackageForKB {
+    <#
+        Returns the full ordered set of package files for this KB/architecture
+        (prerequisites first, target CU last), downloading any not already available
+        locally. Returns an empty array on failure.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$KB,
+        [Parameter(Mandatory=$true)][ValidateSet('x64','arm64')][string]$Arch,
+        [string]$DestinationDir
+    )
+
+    $row = Get-CatalogUpdateRow -KB $KB -Arch $Arch
+    if (-not $row) {
+        if ($OpenCatalog) {
+            $browse = "$($Script:CatalogBase)/Search.aspx?q=" + [uri]::EscapeDataString($KB)
+            Write-Host "Opening catalog for manual download: $browse"
+            try { Start-Process -FilePath $browse } catch { Write-Host "Unable to open a browser here." -ForegroundColor Yellow }
+        }
+        return @()
+    }
+
+    Write-Host "Selected: $($row.Title)" -ForegroundColor Green
+
+    $files = @(Get-CatalogDownloadFile -UpdateId $row.UpdateId -KB $KB)
+    if ($files.Count -eq 0) { return @() }
+
+    Write-Host "Package set ($($files.Count) file(s), listed in DISM apply order):"
+    foreach ($f in $files) {
+        $tag = if ($f.IsTarget) { 'target CU   ' } else { 'prerequisite' }
+        Write-Host "  [$tag] $($f.FileName)"
+    }
+
+    $resolved = New-Object System.Collections.Generic.List[string]
+
+    foreach ($f in $files) {
+        # The source drive acts as a cache so a package already staged is not re-fetched.
+        if (-not $SkipLocalSearch) {
+            $local = Find-FileOnDrive -RootPath $SourceDrive -FileName $f.FileName
+            if ($local) {
+                Write-Host "  reusing from ${SourceDrive}: $local" -ForegroundColor Green
+                $resolved.Add($local)
+                continue
+            }
+        }
+
+        if ($WhatIf) {
+            # [IO.Path]::Combine, not Join-Path: the destination drive (e.g. E:) may not
+            # be mounted during a dry run, and Join-Path fails on an unknown PSDrive.
+            $planned = [IO.Path]::Combine($DestinationDir, $f.FileName)
+            Write-Host "  WhatIf: would download $($f.Url) -> $planned" -ForegroundColor Cyan
+            $resolved.Add($planned)
+            continue
+        }
+
+        $bytes = Get-RemoteFileSize -Url $f.Url
+        $resolved.Add((Save-UpdatePackage -Url $f.Url -DestinationDir $DestinationDir -ExpectedBytes $bytes))
+    }
+
+    return @($resolved)
+}
+
+#endregion
+
+#region Local flash-drive fallback
+
+function Find-FileOnDrive {
+    param([string]$RootPath, [string]$FileName)
+
+    if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
+
+    return Get-ChildItem -Path $RootPath -Recurse -File -Filter $FileName -ErrorAction SilentlyContinue |
+           Select-Object -First 1 -ExpandProperty FullName
 }
 
 function Find-PackageByKBOnDrive {
-	param(
-		[string]$RootPath,
-		[string]$KB
-	)
-	if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
-	$candidates = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
-		Where-Object { $_.Name -match [regex]::Escape($KB) -and ($_.Extension -in '.msu','.cab') }
-	if ($candidates) { return $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName }
-	return $null
+    param([string]$RootPath, [string]$KB, [string]$Arch)
+
+    if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
+
+    $candidates = Get-ChildItem -Path $RootPath -Recurse -File -Include '*.msu','*.cab' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match [regex]::Escape($KB) }
+
+    if ($Arch) {
+        $candidates = $candidates | Where-Object { $_.Name -match "(?<![a-z0-9])$Arch(?![a-z0-9])" }
+    }
+
+    if ($candidates) {
+        return $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    return $null
 }
 
-function Download-UpdatePackage {
-	param(
-		[string]$Url,
-		[string]$DestinationDir
-	)
+function Find-PackagesOnDrive {
+    param([string]$RootPath)
 
-	Ensure-Directory -Path $DestinationDir
+    if (-not (Test-Path -LiteralPath $RootPath)) { return $null }
 
-	$fileName = Split-Path -Path $Url -Leaf
-	$destPath = Join-Path $DestinationDir $fileName
-	if (Test-Path -LiteralPath $destPath) { return $destPath }
+    $candidates = Get-ChildItem -Path $RootPath -Recurse -File -Include '*.msu','*.cab' -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -match 'KB\d{6,7}' -or
+            $_.Name -match 'Cumulative' -or
+            $_.Name -match 'Windows11|Win11|Windows_11'
+        }
 
-	Write-Host "Downloading $Url -> $destPath"
-	try {
-		Invoke-WebRequest -Uri $Url -OutFile $destPath -UseBasicParsing -Headers @{ 'User-Agent' = 'Mozilla/5.0' }
-		return $destPath
-	}
-	catch {
-		throw "Failed to download update package: $($_.Exception.Message)"
-	}
+    if ($candidates) {
+        return $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    return $null
+}
+
+#endregion
+
+#region Part 3 - apply offline with DISM
+
+function Assert-OfflineTarget {
+    param([string]$TargetRoot)
+
+    $targetWindows = Join-Path $TargetRoot 'Windows'
+    if (-not (Test-Path -LiteralPath $targetWindows)) {
+        throw "Target Windows directory not found: $targetWindows"
+    }
+
+    $targetResolved  = (Resolve-Path -LiteralPath $targetWindows).Path.TrimEnd('\')
+    $runningResolved = (Resolve-Path -LiteralPath $env:SystemRoot).Path.TrimEnd('\')
+
+    if ($targetResolved -ieq $runningResolved) {
+        throw ("Refusing to service the RUNNING operating system ($targetResolved) with dism /Image. " +
+               "Boot into WinPE and target the offline volume, or run dism /Online manually.")
+    }
 }
 
 function Install-CumulativeUpdate {
-	param(
-		[string]$PackagePath,
-		[string]$TargetRoot
-	)
+    param([string]$PackageFile, [string]$TargetRoot)
 
-	if (-not (Test-Path -LiteralPath $PackagePath)) { throw "Package not found: $PackagePath" }
-	if (-not (Test-Path -LiteralPath (Join-Path $TargetRoot 'Windows'))) { throw "Target Windows root not found: $TargetRoot" }
+    if (-not (Test-Path -LiteralPath $PackageFile)) { throw "Package not found: $PackageFile" }
+    Assert-OfflineTarget -TargetRoot $TargetRoot
 
-	$logPath = Join-Path $TargetRoot 'Windows\Logs\AutoCU-install.log'
-	Write-Host "Installing update package from $PackagePath"
-	if ($WhatIf) {
-		Write-Host "WhatIf: would run: dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath"
-	}
-	else {
-		dism /Image:$TargetRoot /Add-Package /PackagePath:$PackagePath /IgnoreCheck /LogPath:$logPath
-	}
+    $logPath = Join-Path $TargetRoot 'Windows\Logs\AutoCU-install.log'
+    Write-Host "Applying $PackageFile to offline image $TargetRoot" -ForegroundColor Cyan
+
+    if ($WhatIf) {
+        Write-Host "WhatIf: dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /LogPath:$logPath" -ForegroundColor Cyan
+        return
+    }
+
+    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /LogPath:$logPath
+    if ($LASTEXITCODE -ne 0) { throw "DISM failed with exit code $LASTEXITCODE. See $logPath" }
+
+    Write-Host "DISM completed successfully." -ForegroundColor Green
 }
 
-# High-level part 1: find the current CU KB ID
-function Find-CurrentCUKB {
-	param([int]$DaysBack = 30)
-	return Get-LatestKBFromUpdateHistory -DaysBack $DaysBack
+#endregion
+
+#==============================  Main  ==============================
+
+# Install mode is explicit: use the package the caller supplied and skip all discovery.
+if ($Mode -eq 'Install') {
+    if (-not $PackagePath) { throw "-Mode Install requires -PackagePath." }
+    Install-CumulativeUpdate -PackageFile $PackagePath -TargetRoot $TargetRoot
+    Write-Host 'Install completed.'
+    return
 }
 
-# High-level part 2: download the .msu for a KB (uses existing helpers)
-function Download-MSUForKB {
-	param(
-		[Parameter(Mandatory=$true)][string]$KBToGet,
-		[string]$DestinationDir = $DestinationPath
-	)
-
-	# Check flash for matching package first
-	$existing = Find-PackageByKBOnDrive -RootPath $SourceDrive -KB $KBToGet
-	if ($existing) { Write-Host "Found $KBToGet on drive: $existing"; return $existing }
-
-	# Try to get direct download URL via catalog
-	$fileUrl = Get-DownloadUrlForKBWithRetries -KB $KBToGet -Attempts 3 -DelaySeconds 2
-	if (-not $fileUrl) {
-		$browseUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($KBToGet)
-		Write-Host "Could not automatically locate .msu for $KBToGet. Catalog: $browseUrl" -ForegroundColor Yellow
-		if ($OpenCatalog) { try { Start-Process -FilePath $browseUrl } catch { Write-Host "Unable to open browser." -ForegroundColor Yellow } }
-		return $null
-	}
-
-	$fileName = Split-Path -Path $fileUrl -Leaf
-	$destPath = Join-Path $DestinationDir $fileName
-	if ($WhatIf) {
-		Write-Host "WhatIf: would download $fileUrl -> $destPath"
-		return $destPath
-	}
-
-	return Download-UpdatePackage -Url $fileUrl -DestinationDir $DestinationDir
-}
-
-# High-level part 3: apply the msu with DISM
-function Apply-MSUWithDISM {
-	param(
-		[Parameter(Mandatory=$true)][string]$MSUPath,
-		[string]$Target = $TargetRoot
-	)
-	Install-CumulativeUpdate -PackagePath $MSUPath -TargetRoot $Target
-}
-
-
-# Main flow: prefer update-history page
-$kbFromHistory = Get-LatestKBFromUpdateHistory
-if ($kbFromHistory) {
-	Write-Host "Found recent KB from update-history: $kbFromHistory"
-	$packageOnDrive = Find-PackageByKBOnDrive -RootPath $SourceDrive -KB $kbFromHistory
-	if ($packageOnDrive) {
-		Write-Host "Found $kbFromHistory package on source drive: $packageOnDrive"
-		$packagePath = $packageOnDrive
-	}
-	else {
-		Write-Host "No $kbFromHistory file on flash; searching Microsoft Update Catalog for $kbFromHistory"
-		$updateId = Get-UpdateIdFromSearchPage -Query $kbFromHistory
-		if (-not $updateId) {
-			Write-Host "Could not find updateid for $kbFromHistory in catalog; falling back to any package on drive" -ForegroundColor Yellow
-			$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
-			if ($packageOnDrive) { $packagePath = $packageOnDrive }
-			else {
-				if ($WhatIf) { Write-Host "WhatIf: no package on drive for $kbFromHistory; would require manual download." -ForegroundColor Yellow; exit 0 }
-				else { throw "Failed to locate any package to install. Manual download required." }
-			}
-		}
-		else {
-			$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $updateId
-			if (-not $fileUrl) { throw "Could not extract a direct download URL for updateid $updateId. Manual download required." }
-			$packagePath = Download-UpdatePackage -Url $fileUrl -DestinationDir $DestinationPath
-			Write-Host "Downloaded package to $packagePath"
-		}
-	}
+$targetKB = $null
+if ($KB) {
+    $targetKB = if ($KB -match '^\d+$') { "KB$KB" } else { $KB.ToUpper() }
+    Write-Host "Using caller-supplied KB: $targetKB"
 }
 else {
-	Write-Host "Update-history parsing failed or no recent CU found; attempting catalog search as fallback."
-	# Try Update Catalog fallback using broad SearchQuery
-	try {
-		$updateId = Get-UpdateIdFromSearchPage -Query $SearchQuery
-	}
-	catch {
-		$updateId = $null
-	}
-
-	if ($updateId) {
-		Write-Host "Found updateid from catalog search: $updateId"
-		$fileUrl = Get-DownloadUrlFromUpdateId -UpdateId $updateId
-		if ($fileUrl) {
-			$packagePath = Download-UpdatePackage -Url $fileUrl -DestinationDir $DestinationPath
-			Write-Host "Downloaded package to $packagePath"
-		}
-		else {
-			Write-Host "Catalog search returned updateid but no direct download URL. Falling back to flash-drive packages." -ForegroundColor Yellow
-			$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
-			if ($packageOnDrive) { $packagePath = $packageOnDrive }
-			else {
-				if ($OpenCatalog) {
-					$browseUrl = "https://www.catalog.update.microsoft.com/Search.aspx?q=" + [uri]::EscapeDataString($kbFromHistory)
-					Write-Host "Opening catalog search page for manual download: $browseUrl"
-					try { Start-Process -FilePath $browseUrl } catch { Write-Host "Unable to open browser in this environment." -ForegroundColor Yellow }
-					if ($WhatIf) { exit 0 }
-					throw "Catalog fallback failed; opened catalog page for manual download."
-				}
-				else { throw "No package found on $SourceDrive and catalog fallback failed. Manual download required." }
-			}
-		}
-	}
-	else {
-		Write-Host "Catalog search did not return an updateid; using most-recent package on flash drive." -ForegroundColor Yellow
-		$packageOnDrive = Find-PackagesOnDrive -RootPath $SourceDrive
-		if ($packageOnDrive) {
-			Write-Host "Found package on source drive: $packageOnDrive"
-			$packagePath = $packageOnDrive
-		}
-		else {
-			throw "No package found on $SourceDrive and update-history/catalog lookup provided no candidate. Manual download required."
-		}
-	}
+    $latest = Get-LatestCU -DaysBack $DaysBack -IncludePreview:$IncludePreview
+    if (-not $latest) { throw "Could not determine the current 25H2 cumulative update from the update-history page." }
+    $targetKB = $latest.KB
+    Write-Host ("Latest 25H2 CU: {0}  build {1}  [{2}]" -f $latest.KB, $latest.Build, $latest.ReleaseType) -ForegroundColor Green
 }
 
-if (-not $packagePath) {
-	if ($WhatIf) {
-		Write-Host "WhatIf: no package was located. Script would have required a manual download or further catalog investigation." -ForegroundColor Yellow
-		exit 0
-	}
-	else {
-		throw "No package located to install. Manual download required."
-	}
+if ($Mode -eq 'Find') {
+    Write-Host "Find complete: $targetKB"
+    return
 }
 
-Install-CumulativeUpdate -PackagePath $packagePath -TargetRoot $TargetRoot
+# Deliberately NOT named $packagePath: PowerShell variables are case-insensitive, so
+# that would silently overwrite the $PackagePath parameter.
+$resolvedPackages = [ordered]@{}
+
+foreach ($arch in $Architecture) {
+    Write-Host ""
+    Write-Host "--- $targetKB / $arch ---" -ForegroundColor Cyan
+
+    $pkgSet = @(Get-PackageForKB -KB $targetKB -Arch $arch -DestinationDir $DestinationPath)
+
+    if ($pkgSet.Count -eq 0 -and -not $SkipLocalSearch) {
+        Write-Host "Catalog path failed for $arch; falling back to newest package on $SourceDrive." -ForegroundColor Yellow
+        $fallback = Find-PackagesOnDrive -RootPath $SourceDrive
+        if ($fallback) {
+            Write-Host "WARNING: fallback package is unverified and may omit checkpoint prerequisites." -ForegroundColor Yellow
+            $pkgSet = @($fallback)
+        }
+    }
+
+    if ($pkgSet.Count -gt 0) { $resolvedPackages[$arch] = $pkgSet }
+    else                     { Write-Host "No package obtained for $targetKB / $arch." -ForegroundColor Yellow }
+}
+
+if ($resolvedPackages.Count -eq 0) {
+    if ($WhatIf) { Write-Host "WhatIf: no package located." -ForegroundColor Yellow; return }
+    throw "Failed to locate a package for $targetKB. Manual download required."
+}
+
+if ($Mode -eq 'Download') {
+    Write-Host ""
+    Write-Host "Download complete:" -ForegroundColor Green
+    foreach ($entry in $resolvedPackages.GetEnumerator()) {
+        Write-Host "  $($entry.Key):"
+        foreach ($file in @($entry.Value)) { Write-Host "    $file" }
+    }
+    return
+}
+
+# Mode = All -> install. Only one architecture can apply to a given offline image.
+if ($resolvedPackages.Count -gt 1) {
+    throw ("Multiple architectures were resolved ({0}). Re-run with a single -Architecture, " -f ($resolvedPackages.Keys -join ', ')) +
+          "or use -Mode Install -PackagePath <file> to choose explicitly."
+}
+
+# Apply in order: checkpoint prerequisites first, then the target CU.
+$selected = @(@($resolvedPackages.Values)[0])
+foreach ($file in $selected) {
+    Install-CumulativeUpdate -PackageFile $file -TargetRoot $TargetRoot
+}
 
 Write-Host 'AutoCU update processing completed.'
-
