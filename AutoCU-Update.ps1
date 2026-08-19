@@ -356,6 +356,105 @@ function Get-RemoteFileSize {
     return $null
 }
 
+function Format-Bytes {
+    param([int64]$Bytes)
+    if ($Bytes -ge 1GB) { return "{0:N2} GB" -f ($Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return "{0:N1} MB" -f ($Bytes / 1MB) }
+    return "{0:N0} KB" -f ($Bytes / 1KB)
+}
+
+function Invoke-StreamDownload {
+    <#
+        Streams the response to disk in chunks so download progress can be reported.
+
+        Invoke-WebRequest -OutFile is not used here: it gives no usable progress, and on
+        Windows PowerShell 5.1 (likely in WinPE) its own progress handling is what makes
+        multi-GB transfers crawl. HttpWebRequest works on both 5.1 and 7.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Url,
+        [Parameter(Mandatory=$true)][string]$OutFile,
+        [int64]$ExpectedBytes
+    )
+
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.UserAgent        = $Script:UserAgent
+    $request.Timeout          = 120000      # connect
+    $request.ReadWriteTimeout = 300000      # stall between chunks
+    $request.AllowAutoRedirect = $true
+
+    $response = $null; $input = $null; $output = $null
+    try {
+        $response = $request.GetResponse()
+
+        # Prefer the server's ContentLength for the progress denominator - it describes
+        # this transfer. $ExpectedBytes is what the caller verifies against afterwards.
+        $total = if ([int64]$response.ContentLength -gt 0) { [int64]$response.ContentLength } else { $ExpectedBytes }
+        $input  = $response.GetResponseStream()
+        $output = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+
+        $buffer    = New-Object byte[] (1MB)
+        $totalRead = [int64]0
+        $clock     = [System.Diagnostics.Stopwatch]::StartNew()
+        $lastTick  = [int64]0
+        $lineWidth = 0
+
+        # In-place `r repainting only works on a live console. When output is redirected
+        # (transcript, log file, CI) it collapses into one unreadable line, so fall back
+        # to one discrete line per 10%.
+        $redirected = [Console]::IsOutputRedirected
+        $nextLogPct = 0
+
+        while (($read = $input.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $output.Write($buffer, 0, $read)
+            $totalRead += $read
+
+            $elapsedMs = $clock.ElapsedMilliseconds
+            $done      = ($totalRead -eq $total)
+
+            # Repaint at most ~2x/second so the console (and any transcript) stays readable.
+            if ($elapsedMs - $lastTick -ge 500 -or $done) {
+                $lastTick = $elapsedMs
+                $seconds  = [math]::Max($clock.Elapsed.TotalSeconds, 0.001)
+                $rate     = $totalRead / $seconds
+
+                if ($total -gt 0) {
+                    $pct  = [math]::Min(100, [math]::Round(($totalRead / $total) * 100, 1))
+                    $eta  = if ($rate -gt 0) { [TimeSpan]::FromSeconds(($total - $totalRead) / $rate) } else { [TimeSpan]::Zero }
+                    $line = "    {0,5:N1}%  {1} / {2}  at {3}/s  eta {4:mm\:ss}" -f `
+                            $pct, (Format-Bytes $totalRead), (Format-Bytes $total), (Format-Bytes ([int64]$rate)), $eta
+                }
+                else {
+                    $line = "    {0} at {1}/s" -f (Format-Bytes $totalRead), (Format-Bytes ([int64]$rate))
+                }
+
+                if ($redirected) {
+                    $reached = if ($total -gt 0) { [int][math]::Floor(($totalRead / $total) * 100) } else { 0 }
+                    if ($reached -ge $nextLogPct -or $done) {
+                        Write-Host $line.TrimEnd()
+                        $nextLogPct = [math]::Max($nextLogPct + 10, $reached + 10)
+                    }
+                }
+                else {
+                    # Pad to erase the tail of any longer previous line, then return to column 0.
+                    if ($line.Length -lt $lineWidth) { $line = $line.PadRight($lineWidth) }
+                    $lineWidth = $line.Length
+                    Write-Host "`r$line" -NoNewline
+                }
+            }
+        }
+
+        $output.Flush()
+        if (-not $redirected) { Write-Host "" }   # close off the in-place progress line
+        return $totalRead
+    }
+    finally {
+        if ($output)   { $output.Dispose() }
+        if ($input)    { $input.Dispose() }
+        if ($response) { $response.Dispose() }
+    }
+}
+
 function Save-UpdatePackage {
     param(
         [Parameter(Mandatory=$true)][string]$Url,
@@ -378,13 +477,14 @@ function Save-UpdatePackage {
         Remove-Item -LiteralPath $destPath -Force
     }
 
-    $sizeText = if ($ExpectedBytes) { " ($([math]::Round($ExpectedBytes/1MB,1)) MB)" } else { '' }
+    $sizeText = if ($ExpectedBytes) { " ($(Format-Bytes $ExpectedBytes))" } else { '' }
     Write-Host "Downloading$sizeText -> $destPath"
 
     # Download to .partial so an interrupted transfer is never mistaken for a good file.
-    $tmp = "$destPath.partial"
+    $tmp   = "$destPath.partial"
+    $start = Get-Date
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing -Headers @{ 'User-Agent' = $Script:UserAgent } -TimeoutSec 3600
+        $null = Invoke-StreamDownload -Url $Url -OutFile $tmp -ExpectedBytes $ExpectedBytes
     }
     catch {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
@@ -398,7 +498,9 @@ function Save-UpdatePackage {
     }
 
     Move-Item -LiteralPath $tmp -Destination $destPath -Force
-    Write-Host "Downloaded: $destPath" -ForegroundColor Green
+
+    $took = (Get-Date) - $start
+    Write-Host ("Downloaded {0} in {1:mm\:ss}: {2}" -f (Format-Bytes $got), $took, $destPath) -ForegroundColor Green
     return $destPath
 }
 
