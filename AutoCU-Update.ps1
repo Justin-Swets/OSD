@@ -13,10 +13,18 @@
 .NOTES
     25H2 and 24H2 ship under the SAME KB (e.g. KB5121003 = builds 26200.9168 and
     26100.9168) but as SEPARATE catalog packages. Selection is therefore filtered on
-    the catalog title's "version 25H2" and "<arch>-based" text, not on the KB alone.
+    the catalog title's build number, not on the KB alone.
+
+    The catalog also returns a checkpoint prerequisite (KB5043080, the 2024-09 24H2
+    baseline) alongside the CU. That checkpoint is only required for images that predate
+    it. Applying it to an already-serviced image fails with 0x80070228 / error 552
+    ("An error occurred applying the Unattend.xml file from the .msu package"), so it is
+    downloaded but NOT applied unless -IncludePrerequisites is passed - and even then a
+    prerequisite failure is logged rather than aborting the run.
 
     Install is offline-only (dism /Image). Run from WinPE. DISM rejects /Image against
-    the running OS, so this script fails fast in that case.
+    the running OS, so this script fails fast in that case. The target image's build is
+    read up front, before anything is downloaded.
 
 .EXAMPLE
     .\AutoCU-Update.ps1 -Mode Find
@@ -37,7 +45,9 @@ param(
     [string]$KB,
     [string]$PackagePath,
     [int]$DaysBack = 45,
+    [string]$ScratchDir,
     [switch]$IncludePreview,
+    [switch]$IncludePrerequisites,
     [switch]$SkipLocalSearch,
     [switch]$WhatIf,
     [switch]$OpenCatalog
@@ -425,33 +435,43 @@ function Get-PackageForKB {
         Write-Host "  [$tag] $($f.FileName)"
     }
 
-    $resolved = New-Object System.Collections.Generic.List[string]
+    $resolved = New-Object System.Collections.Generic.List[object]
 
     foreach ($f in $files) {
+        $path = $null
+
         # The source drive acts as a cache so a package already staged is not re-fetched.
         if (-not $SkipLocalSearch) {
             $local = Find-FileOnDrive -RootPath $SourceDrive -FileName $f.FileName
             if ($local) {
                 Write-Host "  reusing from ${SourceDrive}: $local" -ForegroundColor Green
-                $resolved.Add($local)
-                continue
+                $path = $local
             }
         }
 
-        if ($WhatIf) {
+        if (-not $path -and $WhatIf) {
             # [IO.Path]::Combine, not Join-Path: the destination drive (e.g. E:) may not
             # be mounted during a dry run, and Join-Path fails on an unknown PSDrive.
-            $planned = [IO.Path]::Combine($DestinationDir, $f.FileName)
-            Write-Host "  WhatIf: would download $($f.Url) -> $planned" -ForegroundColor Cyan
-            $resolved.Add($planned)
-            continue
+            $path = [IO.Path]::Combine($DestinationDir, $f.FileName)
+            Write-Host "  WhatIf: would download $($f.Url) -> $path" -ForegroundColor Cyan
         }
 
-        $bytes = Get-RemoteFileSize -Url $f.Url
-        $resolved.Add((Save-UpdatePackage -Url $f.Url -DestinationDir $DestinationDir -ExpectedBytes $bytes))
+        if (-not $path) {
+            $bytes = Get-RemoteFileSize -Url $f.Url
+            $path  = Save-UpdatePackage -Url $f.Url -DestinationDir $DestinationDir -ExpectedBytes $bytes
+        }
+
+        $resolved.Add([pscustomobject]@{
+            Path     = $path
+            FileName = $f.FileName
+            KB       = $f.KB
+            IsTarget = $f.IsTarget
+        })
     }
 
-    return @($resolved)
+    # .ToArray(), not @($resolved): on PowerShell 7.6 the array subexpression operator
+    # throws "Argument types do not match" for a List[object] holding PSCustomObjects.
+    return $resolved.ToArray()
 }
 
 #endregion
@@ -524,24 +544,96 @@ function Assert-OfflineTarget {
     }
 }
 
-function Install-CumulativeUpdate {
-    param([string]$PackageFile, [string]$TargetRoot)
+function Get-OfflineImageBuild {
+    <#
+        Reads CurrentBuild/UBR from the offline image's SOFTWARE hive, e.g. 26200.8457.
+        Knowing this up front lets a non-applicable update be caught before a ~5 GB
+        download rather than after DISM rejects it. Returns $null if it cannot be read.
+    #>
+    param([string]$TargetRoot)
 
-    if (-not (Test-Path -LiteralPath $PackageFile)) { throw "Package not found: $PackageFile" }
+    $hive = Join-Path $TargetRoot 'Windows\System32\config\SOFTWARE'
+    if (-not (Test-Path -LiteralPath $hive)) { return $null }
+
+    $mountKey = 'AutoCU_Offline'
+    $loaded   = $false
+
+    try {
+        $null = reg load "HKLM\$mountKey" $hive 2>&1
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $loaded = $true
+
+        $cv = Get-ItemProperty -Path "HKLM:\$mountKey\Microsoft\Windows NT\CurrentVersion" -ErrorAction Stop
+        if (-not $cv.CurrentBuild) { return $null }
+
+        $ubr = if ($null -ne $cv.UBR) { [int]$cv.UBR } else { 0 }
+        return [pscustomobject]@{
+            Build   = [int]$cv.CurrentBuild
+            UBR     = $ubr
+            Display = "$([int]$cv.CurrentBuild).$ubr"
+        }
+    }
+    catch { return $null }
+    finally {
+        if ($loaded) {
+            # Release the handles Get-ItemProperty took, or the hive will not unload.
+            [gc]::Collect()
+            [gc]::WaitForPendingFinalizers()
+            $null = reg unload "HKLM\$mountKey" 2>&1
+        }
+    }
+}
+
+function Initialize-ScratchDir {
+    <#
+        WinPE's default scratch space is the X: RAM disk, which DISM warns is too small
+        ("recommended size is at least 1024 MB"). Expanding a ~5 GB MSU there fails, so
+        servicing always runs with an explicit /ScratchDir on a real volume.
+    #>
+    param([string]$TargetRoot)
+
+    $path = if ($ScratchDir) { $ScratchDir } else { Join-Path $TargetRoot 'OSDScratch' }
+    Ensure-Directory -Path $path
+    return (Resolve-Path -LiteralPath $path).Path
+}
+
+function Install-CumulativeUpdate {
+    param(
+        [string]$PackageFile,
+        [string]$TargetRoot,
+        [string]$Scratch,
+        [switch]$NonFatal
+    )
+
+    # Under -WhatIf nothing was downloaded, so the file legitimately does not exist yet.
+    if (-not $WhatIf -and -not (Test-Path -LiteralPath $PackageFile)) {
+        throw "Package not found: $PackageFile"
+    }
     Assert-OfflineTarget -TargetRoot $TargetRoot
 
+    if (-not $Scratch) { $Scratch = Initialize-ScratchDir -TargetRoot $TargetRoot }
+
     $logPath = Join-Path $TargetRoot 'Windows\Logs\AutoCU-install.log'
-    Write-Host "Applying $PackageFile to offline image $TargetRoot" -ForegroundColor Cyan
+    Write-Host "Applying $(Split-Path $PackageFile -Leaf) to offline image $TargetRoot" -ForegroundColor Cyan
 
     if ($WhatIf) {
-        Write-Host "WhatIf: dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /LogPath:$logPath" -ForegroundColor Cyan
-        return
+        Write-Host "WhatIf: dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /ScratchDir:$Scratch /LogPath:$logPath" -ForegroundColor Cyan
+        return $true
     }
 
-    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /LogPath:$logPath
-    if ($LASTEXITCODE -ne 0) { throw "DISM failed with exit code $LASTEXITCODE. See $logPath" }
+    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /ScratchDir:$Scratch /LogPath:$logPath
+
+    if ($LASTEXITCODE -ne 0) {
+        $msg = "DISM failed with exit code $LASTEXITCODE for $(Split-Path $PackageFile -Leaf). See $logPath"
+        if ($NonFatal) {
+            Write-Host "WARNING: $msg" -ForegroundColor Yellow
+            return $false
+        }
+        throw $msg
+    }
 
     Write-Host "DISM completed successfully." -ForegroundColor Green
+    return $true
 }
 
 #endregion
@@ -551,12 +643,23 @@ function Install-CumulativeUpdate {
 # Install mode is explicit: use the package the caller supplied and skip all discovery.
 if ($Mode -eq 'Install') {
     if (-not $PackagePath) { throw "-Mode Install requires -PackagePath." }
-    Install-CumulativeUpdate -PackageFile $PackagePath -TargetRoot $TargetRoot
+    Install-CumulativeUpdate -PackageFile $PackagePath -TargetRoot $TargetRoot | Out-Null
     Write-Host 'Install completed.'
-    return
+    exit 0
 }
 
-$targetKB = $null
+# Validate the servicing target BEFORE downloading ~5 GB. Previously the offline-target
+# check ran only at install time, after the download had already completed.
+$imageBuild = $null
+if ($Mode -eq 'All') {
+    Assert-OfflineTarget -TargetRoot $TargetRoot
+    $imageBuild = Get-OfflineImageBuild -TargetRoot $TargetRoot
+    if ($imageBuild) { Write-Host "Offline image build: $($imageBuild.Display)" -ForegroundColor Cyan }
+    else             { Write-Host "Could not read the offline image build from $TargetRoot." -ForegroundColor Yellow }
+}
+
+$targetKB    = $null
+$targetBuild = $null
 if ($KB) {
     $targetKB = if ($KB -match '^\d+$') { "KB$KB" } else { $KB.ToUpper() }
     Write-Host "Using caller-supplied KB: $targetKB"
@@ -564,13 +667,22 @@ if ($KB) {
 else {
     $latest = Get-LatestCU -DaysBack $DaysBack -IncludePreview:$IncludePreview
     if (-not $latest) { throw "Could not determine the current 25H2 cumulative update from the update-history page." }
-    $targetKB = $latest.KB
+    $targetKB    = $latest.KB
+    $targetBuild = $latest.Revision
     Write-Host ("Latest 25H2 CU: {0}  build {1}  [{2}]" -f $latest.KB, $latest.Build, $latest.ReleaseType) -ForegroundColor Green
 }
 
 if ($Mode -eq 'Find') {
     Write-Host "Find complete: $targetKB"
-    return
+    exit 0
+}
+
+# Nothing to do if the image already carries this CU or newer.
+if ($imageBuild -and $targetBuild -and
+    $imageBuild.Build -eq [int]$Script:BuildFamily25H2 -and $imageBuild.UBR -ge $targetBuild) {
+    Write-Host ("Image is already at $($imageBuild.Display), which is at or above $targetKB " +
+                "($($Script:BuildFamily25H2).$targetBuild). Nothing to apply.") -ForegroundColor Green
+    exit 0
 }
 
 # Deliberately NOT named $packagePath: PowerShell variables are case-insensitive, so
@@ -597,7 +709,7 @@ foreach ($arch in $Architecture) {
 }
 
 if ($resolvedPackages.Count -eq 0) {
-    if ($WhatIf) { Write-Host "WhatIf: no package located." -ForegroundColor Yellow; return }
+    if ($WhatIf) { Write-Host "WhatIf: no package located." -ForegroundColor Yellow; exit 0 }
     throw "Failed to locate a package for $targetKB. Manual download required."
 }
 
@@ -606,9 +718,9 @@ if ($Mode -eq 'Download') {
     Write-Host "Download complete:" -ForegroundColor Green
     foreach ($entry in $resolvedPackages.GetEnumerator()) {
         Write-Host "  $($entry.Key):"
-        foreach ($file in @($entry.Value)) { Write-Host "    $file" }
+        foreach ($file in @($entry.Value)) { Write-Host "    $($file.Path)" }
     }
-    return
+    exit 0
 }
 
 # Mode = All -> install. Only one architecture can apply to a given offline image.
@@ -617,10 +729,32 @@ if ($resolvedPackages.Count -gt 1) {
           "or use -Mode Install -PackagePath <file> to choose explicitly."
 }
 
-# Apply in order: checkpoint prerequisites first, then the target CU.
 $selected = @(@($resolvedPackages.Values)[0])
-foreach ($file in $selected) {
-    Install-CumulativeUpdate -PackageFile $file -TargetRoot $TargetRoot
+$scratch  = Initialize-ScratchDir -TargetRoot $TargetRoot
+Write-Host "DISM scratch directory: $scratch"
+
+try {
+    # Checkpoint prerequisites are only needed by images that predate them. Applying
+    # KB5043080 to an already-serviced image fails with 0x80070228 / 552, so they are
+    # opt-in and never abort the run - the target CU is what matters.
+    foreach ($file in ($selected | Where-Object { -not $_.IsTarget })) {
+        if (-not $IncludePrerequisites) {
+            Write-Host "Skipping prerequisite $($file.KB) (pass -IncludePrerequisites for a base image that needs it)." -ForegroundColor Yellow
+            continue
+        }
+        Install-CumulativeUpdate -PackageFile $file.Path -TargetRoot $TargetRoot -Scratch $scratch -NonFatal | Out-Null
+    }
+
+    foreach ($file in ($selected | Where-Object { $_.IsTarget })) {
+        Install-CumulativeUpdate -PackageFile $file.Path -TargetRoot $TargetRoot -Scratch $scratch | Out-Null
+    }
+}
+finally {
+    # Only clean up a scratch folder this script created.
+    if (-not $ScratchDir -and (Test-Path -LiteralPath $scratch)) {
+        Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 Write-Host 'AutoCU update processing completed.'
+exit 0
