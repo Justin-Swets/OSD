@@ -231,7 +231,7 @@ If ((get-ciminstance -Class "Win32_ComputerSystem").Model -like "*Surface Laptop
     "-NoProfile", 
     "-ExecutionPolicy Bypass", 
     "-WindowStyle Normal", 
-    "-Command `"iex (irm 'https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/AutoCU-Update-Overrideps1')`""
+    "-Command `"iex (irm 'https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/AutoCU-Update-Override.ps1')`""
     ) -wait -windowstyle normal
 # Do something
 }
