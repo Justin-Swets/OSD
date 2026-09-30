@@ -2,6 +2,30 @@
 Invoke-OSDCloudPEStartup UpdateModule -Value OSD
 Invoke-OSDCloudPEStartup UpdateModule -Value OSDCloud
 
+###Load the newest installed version of each module. UpdateModule installs the new version
+###side by side with the one baked into the boot image, but the old one is already loaded in
+###this session, so Deploy-OSDCloud would keep using it. OSD first: OSDCloud depends on it.
+foreach ($name in 'OSD','OSDCloud') {
+    $newest = Get-Module -Name $name -ListAvailable -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $newest) { Write-Host "Module $name not found." -ForegroundColor Yellow; continue }
+
+    $loaded = Get-Module -Name $name
+    if ($loaded -and $loaded.Version -eq $newest.Version -and $loaded.ModuleBase -eq $newest.ModuleBase) {
+        Write-Host "$name $($newest.Version) already loaded." -ForegroundColor Cyan
+        continue
+    }
+    if ($loaded) { Remove-Module -Name $name -Force -ErrorAction SilentlyContinue }
+    try {
+        # Import by explicit path so the session cannot fall back to an older copy on PSModulePath.
+        Import-Module -Name $newest.Path -Force -Global -ErrorAction Stop
+        Write-Host "Loaded $name $($newest.Version) from $($newest.ModuleBase)" -ForegroundColor Cyan
+    }
+    catch {
+        Write-Host "Failed to load $name $($newest.Version): $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
 ###OSDValidation Function
 function Test-OSDCloudProvisionValidation {
     Add-Type -AssemblyName System.Windows.Forms
