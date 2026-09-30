@@ -1,19 +1,24 @@
 <#
 .SYNOPSIS
-    Finds, downloads, and applies the latest Windows 11 25H2 cumulative update.
+    Finds, downloads, and applies the latest Windows 11 25H2 or 26H2 cumulative update.
 
 .DESCRIPTION
     Part 1  Scrapes the Windows 11 25H2 update-history page for the newest CU,
-            identified by OS Build 26200.x. Monthly and Out-of-band releases are
+            identified by its OS Build family (25H2 = 26200.x, 26H2 = 26300.x). Monthly and Out-of-band releases are
             eligible; Preview (C-release) entries are excluded unless -IncludePreview.
     Part 2  Resolves that KB to a Microsoft Update Catalog row for the requested
             architecture and downloads the .msu/.cab.
     Part 3  Applies the package to an OFFLINE Windows image with DISM.
 
 .NOTES
-    25H2 and 24H2 ship under the SAME KB (e.g. KB5121003 = builds 26200.9168 and
-    26100.9168) but as SEPARATE catalog packages. Selection is therefore filtered on
-    the catalog title's build number, not on the KB alone.
+    25H2, 26H2 and 24H2 ship under the SAME KB (e.g. KB5121003 = builds 26200.9168 and
+    26100.9168; 26H2 headings list 26300.x, 26200.x and 26100.x together) but as SEPARATE
+    catalog packages. Selection is therefore filtered on the catalog title's build
+    number, not on the KB alone.
+
+    -Version Auto (default) picks 25H2 or 26H2 from the offline image's build when
+    -Mode All can read it (26200 -> 25H2, 26300 -> 26H2), otherwise 25H2. Pass
+    -Version explicitly for Find/Download modes against 26H2.
 
     The catalog also returns a checkpoint prerequisite (KB5043080, the 2024-09 24H2
     baseline) alongside the CU. That checkpoint is only required for images that predate
@@ -41,7 +46,8 @@ param(
     [string]$DestinationPath = 'E:\Latest-CU',
     [string]$TargetRoot = 'C:\',
     [ValidateSet('All','Find','Download','Install')][string]$Mode = 'All',
-    [ValidateSet('x64','arm64')][string[]]$Architecture = @('x64'),
+    [ValidateSet('x64','arm64')][string[]]$Architecture,
+    [ValidateSet('Auto','25H2','26H2')][string]$Version = 'Auto',
     [string]$KB,
     [string]$PackagePath,
     [int]$DaysBack = 45,
@@ -58,10 +64,22 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$Script:BuildFamily25H2 = '26200'
-$Script:HistoryUrl      = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history'
+$Script:VersionMap = @{
+    '25H2' = @{ Build = '26200'; Url = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history' }
+    '26H2' = @{ Build = '26300'; Url = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2026/09/windows-11-version-26h2-update-history' }
+}
+$Script:VersionName     = '25H2'
+$Script:BuildFamily     = $Script:VersionMap['25H2'].Build
+$Script:HistoryUrl      = $Script:VersionMap['25H2'].Url
 $Script:CatalogBase     = 'https://www.catalog.update.microsoft.com'
 $Script:UserAgent       = 'Mozilla/5.0'
+
+function Set-TargetVersion {
+    param([Parameter(Mandatory=$true)][ValidateSet('25H2','26H2')][string]$Name)
+    $Script:VersionName = $Name
+    $Script:BuildFamily = $Script:VersionMap[$Name].Build
+    $Script:HistoryUrl  = $Script:VersionMap[$Name].Url
+}
 
 function Ensure-Directory {
     param([string]$Path)
@@ -92,22 +110,24 @@ function ConvertFrom-HtmlCell {
 
 function Get-CUHistoryEntry {
     <#
-        The 25H2 history page embeds EVERY Windows 11 servicing branch (22000, 22621,
-        22631, 26100, 26200, 28000), and the 26H1 (28000) block appears FIRST in the
-        markup. Document order is therefore meaningless - entries must be filtered on
-        the 26200 build family. Each entry is also emitted twice, so results are deduped.
+        The 25H2/26H2 history pages embed EVERY Windows 11 servicing branch (22000, 22621,
+        22631, 26100, 26200, 26300, 28000), and the 26H1 (28000) block can appear FIRST
+        in the markup. Document order is therefore meaningless - entries must be filtered
+        on the target build family, which may sit anywhere in the build list (26H2
+        headings read "OS Builds 26300.x, 26200.x, and 26100.x"). Each entry is also emitted twice, so results are deduped.
 
         Heading format on the page:
             August 11, 2026-KB5121003 (OS Builds 26200.9168 and 26100.9168)
             July 28, 2026-KB5101684 (OS Builds 26200.8973 and 26100.8973) Preview
             July 18, 2026-KB5121767 (OS Builds 26200.8894 and 26100.8894) Out-of-band
+            September 22, 2026-KB5124010 (OS Builds 26300.9550, 26200.9550, and 26100.9550) Preview
     #>
     param(
         [string]$Url = $Script:HistoryUrl,
         [switch]$IncludePreview
     )
 
-    Write-Host "Reading Windows 11 25H2 update history: $Url"
+    Write-Host "Reading Windows 11 $($Script:VersionName) update history: $Url"
     try {
         $resp = Invoke-Page -Uri $Url
     }
@@ -116,8 +136,8 @@ function Get-CUHistoryEntry {
         return @()
     }
 
-    $pattern = '(?<date>[A-Z][a-z]+ \d{1,2}, \d{4})[^<]{0,20}?KB(?<kb>\d{6,7})\s*\(OS Builds?\s*' +
-               $Script:BuildFamily25H2 + '\.(?<rev>\d+)[^)]*\)(?<tag>[^<]{0,24})'
+    $pattern = '(?<date>[A-Z][a-z]+ \d{1,2}, \d{4})[^<]{0,20}?KB(?<kb>\d{6,7})\s*\(OS Builds?[^)]*?(?<![\d.])' +
+               $Script:BuildFamily + '\.(?<rev>\d+)[^)]*\)(?<tag>[^<]{0,24})'
 
     $seen    = @{}
     $entries = New-Object System.Collections.Generic.List[object]
@@ -141,18 +161,25 @@ function Get-CUHistoryEntry {
         $entries.Add([pscustomobject]@{
             KB          = $kbId
             Date        = $parsedDate
-            Build       = "$($Script:BuildFamily25H2).$($m.Groups['rev'].Value)"
+            Build       = "$($Script:BuildFamily).$($m.Groups['rev'].Value)"
             Revision    = [int]$m.Groups['rev'].Value
             ReleaseType = $type
         })
     }
 
     if ($entries.Count -eq 0) {
-        Write-Host "No $($Script:BuildFamily25H2).x entries parsed from the update-history page. Layout may have changed." -ForegroundColor Yellow
+        Write-Host "No $($Script:BuildFamily).x entries parsed from the update-history page. Layout may have changed." -ForegroundColor Yellow
         return @()
     }
 
-    $eligible = if ($IncludePreview) { $entries } else { $entries | Where-Object { $_.ReleaseType -ne 'Preview' } }
+    # .ToArray(), not @($entries): see the PowerShell 7.6 note in Get-PackageForKB.
+    $eligible = if ($IncludePreview) { $entries.ToArray() } else { @($entries | Where-Object { $_.ReleaseType -ne 'Preview' }) }
+    if ($eligible.Count -eq 0) {
+        # Unattended runs get no switches, and a brand-new branch (e.g. 26H2) can have only
+        # a Preview CU. Using it beats failing the whole provisioning run.
+        Write-Host ("Only Preview releases exist for $($Script:VersionName) so far; using the newest Preview.") -ForegroundColor Yellow
+        $eligible = $entries.ToArray()
+    }
 
     # Sort on build revision: monotonic, and independent of date parsing.
     return @($eligible | Sort-Object Revision -Descending)
@@ -164,7 +191,7 @@ function Get-LatestCU {
     $entries = Get-CUHistoryEntry -IncludePreview:$IncludePreview
     if ($entries.Count -eq 0) { return $null }
 
-    Write-Host "25H2 candidates (newest first):" -ForegroundColor Cyan
+    Write-Host "$($Script:VersionName) candidates (newest first):" -ForegroundColor Cyan
     $entries | Select-Object -First 5 | ForEach-Object {
         $d = if ($_.Date) { $_.Date.ToString('yyyy-MM-dd') } else { 'unknown' }
         Write-Host ("  {0}  {1}  build {2}  [{3}]" -f $_.KB, $d, $_.Build, $_.ReleaseType)
@@ -175,8 +202,8 @@ function Get-LatestCU {
     # Staleness is a warning, not a hard filter. Returning $null on a stale page is what
     # made the previous version fall through to an unrelated package on the flash drive.
     if ($latest.Date -and $latest.Date -lt (Get-Date).AddDays(-$DaysBack)) {
-        Write-Host ("WARNING: newest 25H2 CU ({0}, {1}) is older than {2} days. Proceeding anyway." -f
-                    $latest.KB, $latest.Date.ToString('yyyy-MM-dd'), $DaysBack) -ForegroundColor Yellow
+        Write-Host ("WARNING: newest {3} CU ({0}, {1}) is older than {2} days. Proceeding anyway." -f
+                    $latest.KB, $latest.Date.ToString('yyyy-MM-dd'), $DaysBack, $Script:VersionName) -ForegroundColor Yellow
     }
 
     return $latest
@@ -231,9 +258,9 @@ function Get-CatalogUpdateRow {
             # serves localized titles - e.g. the Russian form renders "x64-based Systems"
             # as "процессоров x64" - so matching English prose is unreliable. The KB, the
             # build number and the bare architecture token survive translation, and the
-            # build number is what actually separates 25H2 (26200.x) from 24H2 (26100.x),
+            # build number is what actually separates 25H2 (26200.x) / 26H2 (26300.x) from 24H2 (26100.x),
             # which share the same KB.
-            $buildInTitle = [regex]::Match($title, '\((?<b>' + $Script:BuildFamily25H2 + '\.\d+)\)')
+            $buildInTitle = [regex]::Match($title, '\((?<b>' + $Script:BuildFamily + '\.\d+)\)')
 
             if ($title -notmatch [regex]::Escape($KB))                            { continue }
             if (-not $buildInTitle.Success)                                       { continue }
@@ -263,7 +290,7 @@ function Get-CatalogUpdateRow {
             return $found[0]
         }
 
-        Write-Host "$KB is in the catalog, but no row matched build $($Script:BuildFamily25H2).x + '$Arch' (attempt $try/$attempts)." -ForegroundColor Yellow
+        Write-Host "$KB is in the catalog, but no row matched build $($Script:BuildFamily).x + '$Arch' ($($Script:VersionName)) (attempt $try/$attempts)." -ForegroundColor Yellow
         if ($try -lt $attempts) { Start-Sleep -Seconds 3 }
     }
 
@@ -760,6 +787,25 @@ if ($Mode -eq 'All') {
     else             { Write-Host "Could not read the offline image build from $TargetRoot." -ForegroundColor Yellow }
 }
 
+# Pick the servicing branch. Explicit -Version wins; Auto follows the offline image.
+if ($Version -ne 'Auto') {
+    Set-TargetVersion -Name $Version
+}
+elseif ($imageBuild) {
+    $detected = $Script:VersionMap.Keys | Where-Object { $Script:VersionMap[$_].Build -eq [string]$imageBuild.Build }
+    if ($detected) { Set-TargetVersion -Name $detected }
+    else {
+        Write-Host ("Image build $($imageBuild.Build) is not 25H2 (26200) or 26H2 (26300); defaulting to 25H2. " +
+                    "Pass -Version to override.") -ForegroundColor Yellow
+    }
+}
+Write-Host "Target version: $($Script:VersionName) (build family $($Script:BuildFamily))" -ForegroundColor Cyan
+
+if ($imageBuild -and $Version -ne 'Auto' -and [string]$imageBuild.Build -ne $Script:BuildFamily) {
+    Write-Host ("WARNING: image is build $($imageBuild.Build) but -Version $Version targets $($Script:BuildFamily). " +
+                "DISM will likely reject the package.") -ForegroundColor Yellow
+}
+
 $targetKB    = $null
 $targetBuild = $null
 if ($KB) {
@@ -768,10 +814,10 @@ if ($KB) {
 }
 else {
     $latest = Get-LatestCU -DaysBack $DaysBack -IncludePreview:$IncludePreview
-    if (-not $latest) { throw "Could not determine the current 25H2 cumulative update from the update-history page." }
+    if (-not $latest) { throw "Could not determine the current $($Script:VersionName) cumulative update from the update-history page." }
     $targetKB    = $latest.KB
     $targetBuild = $latest.Revision
-    Write-Host ("Latest 25H2 CU: {0}  build {1}  [{2}]" -f $latest.KB, $latest.Build, $latest.ReleaseType) -ForegroundColor Green
+    Write-Host ("Latest $($Script:VersionName) CU: {0}  build {1}  [{2}]" -f $latest.KB, $latest.Build, $latest.ReleaseType) -ForegroundColor Green
 }
 
 if ($Mode -eq 'Find') {
@@ -781,15 +827,29 @@ if ($Mode -eq 'Find') {
 
 # Nothing to do if the image already carries this CU or newer.
 if ($imageBuild -and $targetBuild -and
-    $imageBuild.Build -eq [int]$Script:BuildFamily25H2 -and $imageBuild.UBR -ge $targetBuild) {
+    $imageBuild.Build -eq [int]$Script:BuildFamily -and $imageBuild.UBR -ge $targetBuild) {
     Write-Host ("Image is already at $($imageBuild.Display), which is at or above $targetKB " +
-                "($($Script:BuildFamily25H2).$targetBuild). Nothing to apply.") -ForegroundColor Green
+                "($($Script:BuildFamily).$targetBuild). Nothing to apply.") -ForegroundColor Green
     exit 0
 }
 
 # Deliberately NOT named $packagePath: PowerShell variables are case-insensitive, so
 # that would silently overwrite the $PackagePath parameter.
 $resolvedPackages = [ordered]@{}
+
+# The default E: drive may not exist on this machine; stage on the target volume instead.
+$destQualifier = Split-Path -Path $DestinationPath -Qualifier -ErrorAction SilentlyContinue
+if ($destQualifier -and -not (Test-Path -LiteralPath "$destQualifier\")) {
+    $fallbackDest = [IO.Path]::Combine($TargetRoot, 'Latest-CU')
+    Write-Host "Drive $destQualifier not present; staging packages in $fallbackDest instead." -ForegroundColor Yellow
+    $DestinationPath = $fallbackDest
+}
+
+# No -Architecture: follow the machine (WinPE arch matches the offline image it services).
+if (-not $Architecture) {
+    $Architecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { @('arm64') } else { @('x64') }
+    Write-Host "Architecture not specified; detected $($Architecture[0])." -ForegroundColor Cyan
+}
 
 foreach ($arch in $Architecture) {
     Write-Host ""
