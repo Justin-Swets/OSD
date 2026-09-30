@@ -46,7 +46,11 @@ param(
     [string]$DestinationPath = 'E:\Latest-CU',
     [string]$TargetRoot = 'C:\',
     [ValidateSet('All','Find','Download','Install')][string]$Mode = 'All',
-    [ValidateSet('x64','arm64')][string[]]$Architecture,
+    # No [ValidateSet] and no default: run through `iex (irm ...)`, PowerShell applies the param
+    # attributes to the variable while it is still empty, and validation then fails with
+    # "The attribute cannot be added because variable Architecture ... would no longer be valid".
+    # Empty means "detect"; the value is validated manually below.
+    [string[]]$Architecture,
     [ValidateSet('Auto','25H2','26H2')][string]$Version = 'Auto',
     [string]$KB,
     [string]$PackagePath,
@@ -849,6 +853,10 @@ if ($destQualifier -and -not (Test-Path -LiteralPath "$destQualifier\")) {
 if (-not $Architecture) {
     $Architecture = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { @('arm64') } else { @('x64') }
     Write-Host "Architecture not specified; detected $($Architecture[0])." -ForegroundColor Cyan
+}
+$Architecture = @($Architecture | ForEach-Object { "$_".ToLower() })
+foreach ($a in $Architecture) {
+    if ($a -notin 'x64','arm64') { throw "Invalid -Architecture '$a'. Valid values: x64, arm64." }
 }
 
 foreach ($arch in $Architecture) {
