@@ -156,3 +156,52 @@ function Run-OSDGUI {
     [void]$form.ShowDialog()
     $form.Dispose()
 }
+
+function Install-OSDGUICommand {
+    <#
+        Writes Run-OSDGUI to a module under the machine-wide module path so it is
+        auto-loaded by EVERY new PowerShell session (e.g. the prompt you open in WinPE
+        after Cloud-Provision.ps1 has finished). A function defined by iex only lives in
+        the session that ran it, which is why it was "not recognized" before.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$ModuleRoot = (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')
+    )
+
+    $dir = Join-Path $ModuleRoot 'OSDGUI'
+    try {
+        New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+
+        $psm1 = @"
+`$Script:OSDRepoOwner  = '$($Script:OSDRepoOwner)'
+`$Script:OSDRepoName   = '$($Script:OSDRepoName)'
+`$Script:OSDRepoBranch = '$($Script:OSDRepoBranch)'
+
+function Get-OSDRepoScript {
+$((Get-Command Get-OSDRepoScript -CommandType Function).Definition)
+}
+
+function Run-OSDGUI {
+$((Get-Command Run-OSDGUI -CommandType Function).Definition)
+}
+
+Export-ModuleMember -Function Run-OSDGUI, Get-OSDRepoScript
+"@
+        Set-Content -Path (Join-Path $dir 'OSDGUI.psm1') -Value $psm1 -Encoding UTF8 -Force -ErrorAction Stop
+
+        # A manifest lets command auto-discovery find Run-OSDGUI without importing first.
+        New-ModuleManifest -Path (Join-Path $dir 'OSDGUI.psd1') -RootModule 'OSDGUI.psm1' `
+            -ModuleVersion '1.0.0' -Description 'Run-OSDGUI: pick and run scripts from Justin-Swets/OSD' `
+            -FunctionsToExport @('Run-OSDGUI', 'Get-OSDRepoScript') -CmdletsToExport @() `
+            -VariablesToExport @() -AliasesToExport @()
+
+        Write-Host "Run-OSDGUI installed: $dir" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Could not install the OSDGUI module ($($_.Exception.Message)); Run-OSDGUI is available in this session only." -ForegroundColor Yellow
+    }
+}
+
+# Loading this script (dot-source or iex) also makes the command permanent for the machine.
+Install-OSDGUICommand
