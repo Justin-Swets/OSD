@@ -110,6 +110,10 @@ Write-Host "File 'os-arm64.json' has been created successfully." -ForegroundColo
 #if ($null -eq $(Get-OSDCatalogDriverPack).name){iex(irm https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/Get-SurfaceDriversv4.ps1)}
 Deploy-OSDCloud
 Test-OSDCloudProvisionValidation
+
+# Last step: define Run-OSDGUI (run it manually when needed).
+iex (irm 'https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/OSD-Test.ps1')
+
 If ($RestartPC -eq "True") {
     Restart-Computer -Force}
 
@@ -237,6 +241,10 @@ If ((get-ciminstance -Class "Win32_ComputerSystem").Model -like "*Surface Laptop
 }
 
 Test-OSDCloudProvisionValidation
+
+# Last step: define Run-OSDGUI (run it manually when needed).
+iex (irm 'https://raw.githubusercontent.com/Justin-Swets/OSD/refs/heads/main/OSD-Test.ps1')
+
 If ($RestartPC -eq "True") {
     Restart-Computer -Force}
 
