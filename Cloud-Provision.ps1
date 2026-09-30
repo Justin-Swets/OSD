@@ -1,3 +1,7 @@
+###Update OSD and OSDCLoud Modules if on Wifi
+Invoke-OSDCloudPEStartup UpdateModule -Value OSD
+Invoke-OSDCloudPEStartup UpdateModule -Value OSDCloud
+
 ###OSDValidation Function
 function Test-OSDCloudProvisionValidation {
     Add-Type -AssemblyName System.Windows.Forms
@@ -17,6 +21,33 @@ function Test-OSDCloudProvisionValidation {
         }Else{
         $RestartPC = "True"
         Return $restartPC
+        }
+    }
+}
+
+###Write a file to every folder matching a wildcard pattern (e.g. multiple OSDCloud module versions)
+function Copy-JsonToAllPaths {
+    param(
+        [Parameter(Mandatory=$true)][string]$Content,
+        [Parameter(Mandatory=$true)][string]$Pattern   # full file path; wildcards allowed in the folders
+    )
+
+    $fileName = Split-Path -Path $Pattern -Leaf
+    $dirs     = @(Get-ChildItem -Path (Split-Path -Path $Pattern -Parent) -Directory -ErrorAction SilentlyContinue)
+
+    if ($dirs.Count -eq 0) {
+        Write-Host "No folders match $(Split-Path -Path $Pattern -Parent); '$fileName' was not written." -ForegroundColor Yellow
+        return
+    }
+
+    foreach ($dir in $dirs) {
+        $dest = Join-Path $dir.FullName $fileName
+        try {
+            $Content | Out-File -FilePath $dest -Encoding utf8 -Force -ErrorAction Stop
+            Write-Host "File '$fileName' has been created successfully: $dest" -ForegroundColor Cyan
+        }
+        catch {
+            Write-Host "Failed to write ${dest}: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 }
@@ -101,9 +132,7 @@ $jsonContent = @"
 
 # 2. Output the content to the file
 # We use -Encoding utf8 to ensure standard JSON compatibility
-$jsonContent | Out-File -FilePath "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\*\Workflow\Default\os-arm64.json" -Encoding utf8 -Force
-
-Write-Host "File 'os-arm64.json' has been created successfully." -ForegroundColor Cyan
+Copy-JsonToAllPaths -Content $jsonContent -Pattern "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\*\Workflow\Default\os-arm64.json"
 
 ##Check Drivers
 
@@ -221,9 +250,7 @@ $jsonContent = @"
 
 # 2. Output the content to the file
 # We use -Encoding utf8 to ensure standard JSON compatibility
-$jsonContent | Out-File -FilePath "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\*\Workflow\Default\os-amd64.json" -Encoding utf8 -Force
-
-Write-Host "File 'os-amd64.json' has been created successfully." -ForegroundColor Cyan
+Copy-JsonToAllPaths -Content $jsonContent -Pattern "X:\Program Files\WindowsPowerShell\Modules\OSDCloud\*\Workflow\Default\os-amd64.json"
 
 ##Check Drivers
 
