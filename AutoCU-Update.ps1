@@ -60,13 +60,98 @@ param(
     [switch]$IncludePrerequisites,
     [switch]$SkipLocalSearch,
     [switch]$WhatIf,
-    [switch]$OpenCatalog
+    [switch]$OpenCatalog,
+    [string]$LogPath
 )
 
 $ErrorActionPreference = 'Stop'
 # CU packages are ~5 GB; the progress bar cripples Invoke-WebRequest throughput on PS 5.1.
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+#region Logging
+
+function Start-AutoCULog {
+    <#
+        Transcribes all console output for troubleshooting failed devices. A device can fail
+        before the target Windows exists, so the log falls back to the WinPE OSDCloud log
+        folder (also collected by Get-Diagnosticlogs.ps1), then to %TEMP%. One file per run,
+        so a retry does not overwrite the failed attempt.
+    #>
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $name  = "AutoCU-Update_$stamp.log"
+
+    $candidates = @()
+    if ($LogPath) { $candidates += $LogPath }
+    $candidates += [IO.Path]::Combine($TargetRoot, 'Windows\Logs')
+    if (Test-Path -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\MiniNT') {
+        $candidates += 'X:\Windows\Temp\osdcloud-logs'
+    }
+    $candidates += $env:TEMP
+
+    foreach ($dir in $candidates) {
+        try {
+            # Only an explicit -LogPath is created; the defaults must already exist, so a
+            # missing C:\Windows is not mistaken for a valid target.
+            if ($dir -eq $LogPath) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+            if (-not (Test-Path -LiteralPath $dir)) { continue }
+
+            $file = Join-Path $dir $name
+
+            # Prove the folder is writable first: Start-Transcript can report success on a
+            # folder the session cannot write to (e.g. C:\Windows\Logs unelevated) and then
+            # silently log nothing.
+            [IO.File]::WriteAllText($file, '')
+
+            Start-Transcript -Path $file -Force -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath $file)) {
+                try { Stop-Transcript | Out-Null } catch { }
+                continue
+            }
+            $Script:TranscriptFile = $file
+            return
+        }
+        catch { continue }
+    }
+    Write-Host 'WARNING: could not start a transcript; console output is not being logged.' -ForegroundColor Yellow
+}
+
+function Stop-AutoCULog {
+    if ($Script:TranscriptFile) {
+        Write-Host "Log: $($Script:TranscriptFile)"
+        try { Stop-Transcript | Out-Null } catch { }
+        $Script:TranscriptFile = $null
+    }
+}
+
+function Exit-AutoCU {
+    <# Every exit goes through here so the transcript is closed and complete. #>
+    param([int]$Code = 0)
+    Write-Host "Exit code: $Code"
+    Stop-AutoCULog
+    exit $Code
+}
+
+function Write-AutoCUEnvironment {
+    <# Context needed to diagnose a failure without access to the device. #>
+    $os   = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cs   = Get-CimInstance -ClassName Win32_ComputerSystem  -ErrorAction SilentlyContinue
+    $bios = Get-CimInstance -ClassName Win32_BIOS            -ErrorAction SilentlyContinue
+    $isPE = Test-Path -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\MiniNT'
+
+    Write-Host '================ AutoCU-Update ================'
+    Write-Host "Started     : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+    Write-Host "Environment : $(if ($isPE) { 'WinPE' } else { 'Full Windows' })  $($os.Caption) $($os.Version)"
+    Write-Host "PowerShell  : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+    Write-Host "Processor   : $env:PROCESSOR_ARCHITECTURE"
+    Write-Host "Device      : $($cs.Manufacturer) $($cs.Model)  Serial $($bios.SerialNumber)"
+    Write-Host "Parameters  : Mode=$Mode TargetRoot=$TargetRoot Version=$Version Architecture=$($Architecture -join ',')"
+    Write-Host "              KB=$KB SourceDrive=$SourceDrive DestinationPath=$DestinationPath WhatIf=$WhatIf"
+    Write-Host "Volumes     : $((Get-PSDrive -PSProvider FileSystem | ForEach-Object { '{0}: {1:N1} GB free' -f $_.Name, ($_.Free / 1GB) }) -join '; ')"
+    Write-Host '==============================================='
+}
+
+#endregion
 
 $Script:VersionMap = @{
     '25H2' = @{ Build = '26200'; Url = 'https://support.microsoft.com/en-us/servicing/os/windows-11/2025/07/windows-11-version-25h2-update-history' }
@@ -754,7 +839,8 @@ function Install-CumulativeUpdate {
         return $true
     }
 
-    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /ScratchDir:$Scratch /LogPath:$logPath
+    # Piped so DISM output is captured by the transcript (direct console writes are not).
+    dism /Image:$TargetRoot /Add-Package /PackagePath:$PackageFile /IgnoreCheck /ScratchDir:$Scratch /LogPath:$logPath | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         $msg = "DISM failed with exit code $LASTEXITCODE for $(Split-Path $PackageFile -Leaf). See $logPath"
@@ -773,12 +859,29 @@ function Install-CumulativeUpdate {
 
 #==============================  Main  ==============================
 
+Start-AutoCULog
+Write-AutoCUEnvironment
+
+# Any terminating error ends up here: record the full error and where it was raised, then
+# close the transcript so the log of a failed device is complete.
+trap {
+    Write-Host ''
+    Write-Host '================ FAILED ================' -ForegroundColor Red
+    Write-Host "Error   : $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "Type    : $($_.Exception.GetType().FullName)"
+    if ($_.InvocationInfo) { Write-Host "At      : line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())" }
+    if ($_.ScriptStackTrace) { Write-Host "Stack   :`n$($_.ScriptStackTrace)" }
+    if ($_.Exception.InnerException) { Write-Host "Inner   : $($_.Exception.InnerException.Message)" }
+    Write-Host '========================================' -ForegroundColor Red
+    Exit-AutoCU 1
+}
+
 # Install mode is explicit: use the package the caller supplied and skip all discovery.
 if ($Mode -eq 'Install') {
     if (-not $PackagePath) { throw "-Mode Install requires -PackagePath." }
     Install-CumulativeUpdate -PackageFile $PackagePath -TargetRoot $TargetRoot | Out-Null
     Write-Host 'Install completed.'
-    exit 0
+    Exit-AutoCU 0
 }
 
 # Validate the servicing target BEFORE downloading ~5 GB. Previously the offline-target
@@ -826,7 +929,7 @@ else {
 
 if ($Mode -eq 'Find') {
     Write-Host "Find complete: $targetKB"
-    exit 0
+    Exit-AutoCU 0
 }
 
 # Nothing to do if the image already carries this CU or newer.
@@ -834,7 +937,7 @@ if ($imageBuild -and $targetBuild -and
     $imageBuild.Build -eq [int]$Script:BuildFamily -and $imageBuild.UBR -ge $targetBuild) {
     Write-Host ("Image is already at $($imageBuild.Display), which is at or above $targetKB " +
                 "($($Script:BuildFamily).$targetBuild). Nothing to apply.") -ForegroundColor Green
-    exit 0
+    Exit-AutoCU 0
 }
 
 # Deliberately NOT named $packagePath: PowerShell variables are case-insensitive, so
@@ -879,7 +982,7 @@ foreach ($arch in $Architecture) {
 }
 
 if ($resolvedPackages.Count -eq 0) {
-    if ($WhatIf) { Write-Host "WhatIf: no package located." -ForegroundColor Yellow; exit 0 }
+    if ($WhatIf) { Write-Host "WhatIf: no package located." -ForegroundColor Yellow; Exit-AutoCU 0 }
     throw "Failed to locate a package for $targetKB. Manual download required."
 }
 
@@ -890,7 +993,7 @@ if ($Mode -eq 'Download') {
         Write-Host "  $($entry.Key):"
         foreach ($file in @($entry.Value)) { Write-Host "    $($file.Path)" }
     }
-    exit 0
+    Exit-AutoCU 0
 }
 
 # Mode = All -> install. Only one architecture can apply to a given offline image.
@@ -927,4 +1030,4 @@ finally {
 }
 
 Write-Host 'AutoCU update processing completed.'
-exit 0
+Exit-AutoCU 0
